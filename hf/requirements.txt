@@ -1,0 +1,11 @@
+torch>=2.2
+# SigLIP 2 needs >= 4.49 (Gemma tokenizer config); tested with 5.17
+transformers>=4.49
+pillow>=10
+# sentencepiece: tokenizer of the previous model (siglip-base-patch16-256-multilingual) — keep for rollback
+sentencepiece>=0.2
+protobuf>=4
+# app.py (Space) — the gradio SDK image already ships gradio/fastapi/uvicorn; pins keep local runs identical
+gradio>=5
+fastapi>=0.110
+uvicorn>=0.29

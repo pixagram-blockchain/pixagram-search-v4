@@ -1,0 +1,24 @@
+{"question": "Who posted the first image of a cat?", "expect": {"author": "matus"}}
+{"question": "Who posted the first cow?", "expect": {"author": "matias"}}
+{"question": "When was the first butterfly posted?", "expect": {"date": "2026-09-11"}}
+{"question": "Who posted the latest cat picture?", "expect": {"author": "karo"}}
+{"question": "How many cat artworks are there?", "expect": {"count": 3, "tolerance": 1}}
+{"question": "How many artworks did laura post?", "expect": {"count": 13}}
+{"question": "Which artist posted the most food artworks?", "expect": {"author": "matus"}}
+{"question": "What is the most liked artwork with a cat?", "expect": {"ref": "matus/the-king-of-the-cats-1789045969677"}}
+{"question": "What was the first artwork posted by wang?", "expect": {"ref": "wang/star-1789448770698"}}
+{"question": "Who posted the first airplane?", "expect": {"author": "light"}}
+{"question": "What is the first image of Mount Fuji?", "expect": {"ref": "wang/-1789731541429"}}
+{"question": "Who posted the first sushi?", "expect": {"author": "matus"}}
+{"question": "What was the first artwork ever posted?", "expect": {"ref": "matias/cow-1788548086746"}}
+{"question": "Qui a posté le premier chat ?", "expect": {"author": "matus"}}
+{"question": "Wer hat die erste Katze gepostet?", "expect": {"author": "matus"}}
+{"question": "When was Good vibes first posted?", "expect": {"date": "2026-09-25"}, "note": "the current 'Good vibes' (pHash 28 bits away from the deleted 09-15 post of the same title: a different image)"}
+{"question": "Who posted the first dog?", "expect": {"author": "matias"}}
+{"question": "How many artworks show mountains?", "expect": {"count": 11, "tolerance": 4}}
+{"question": "Who posted the first robot?", "expect": {"author": "serguey"}}
+{"question": "Who posted the first pirate?", "expect": {"author": "saitam"}}
+{"question": "Which artist posted the most travel artworks?", "expect": {"author": "tetiana"}}
+{"question": "How many black and white artworks are there?", "expect": {"count": 4, "tolerance": 2}}
+{"question": "Who posted the first tiger?", "expect": {"author": "matias"}}
+{"question": "What is the most liked food artwork?", "expect": {"ref": "matus/proper-ham-1789482264957"}}

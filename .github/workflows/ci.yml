@@ -1,0 +1,29 @@
+# Every push and pull request: install, typecheck (Worker and tests), the full test suite (v3's
+# regression tests and v4's), and a dry-run bundle of the Worker. No Cloudflare credentials are
+# needed: the tests run the Worker's code against SQLite and in-memory stand-ins (test/harness).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      # the bundle wrangler would deploy (no upload): catches what the tests' module resolution would not
+      - run: npx wrangler deploy --dry-run --outdir dist -c wrangler.jsonc
+      - name: the v4 question set is well-formed
+        run: python3 -I eval/v4/check.py src/evaluation/datasets/questions.jsonl

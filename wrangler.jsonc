@@ -1,0 +1,211 @@
+{
+  // pixagram-search v4: its own Worker + its own Hugging Face Space (SigLIP 2 NaFlex, as v3). The
+  // v3 stack (Worker pixagram-search-v3, used by the Pixagram UI; Space primerz/pixagram-search-v3),
+  // production (pixagram-search) and v2 are not touched. Create everything and deploy with
+  // scripts/deploy.sh; remove it with scripts/teardown.sh.
+  //
+  // Own:    D1, KV, three Vectorize indexes (images, texts, documentation), queues, Durable
+  //         Object, Workflow, rate-limit namespaces (enrichment state, logs, the caches and the
+  //         vectors are per stack)
+  // Shared: R2 bucket pixagram-art (objects are content-addressed orig/<sha256>, up/<sha256>.png,
+  //         written only when missing and never deleted, so every stack writes identical bytes)
+  //         and Workers AI (models are called per request; nothing is stored there)
+"$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pixagram-search-v4",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  // Native stats + features + xBRZ on a 400px artwork take well under a second of CPU; the
+  // ceiling is raised so a batch of 10 (and a history backfill step) never trips the default 30 s.
+  "limits": { "cpu_ms": 300000 },
+
+  "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
+
+  "vars": {
+    "APP_PREFIXES": "pixagram",
+    "EMBED_DIM": "768",
+    // SigLIP 2 NaFlex: images keep their aspect ratio. The Space serves the same model with
+    // MAX_NUM_PATCHES = EMBED_PATCHES (deploy.sh sets both; a mismatch stops image embedding).
+    // 576 patches measured best on the corpus (256: worse than the fixed 256 px model; 1024: no
+    // better, twice the CPU).
+    "EMBED_MODEL": "google/siglip2-base-patch16-naflex",
+    "EMBED_PATCHES": "576",
+    "HF_EMBED_URL": "https://primerz-pixagram-search-v4.hf.space/embed",
+    // Image fed to SigLIP: xbrz (measured best on the corpus), nearest, native, or a weighted mix
+    // such as "nearest:0.5,xbrz:0.5". Changing it (or EMBED_PATCHES) re-embeds through the sweeper.
+    "EMBED_VIEWS": "xbrz",
+    // SigLIP text vectors of artworks (title, AI caption, tags) and blog posts → VEC_TEXT.
+    "TEXT_VECTORS": "on",
+    // gemma (Gemma 4): Moondream's replies came back empty in production (October 2026).
+    "VLM_BACKEND": "gemma",
+    "VLM_TARGET": "512",
+    // Stages skipped for artworks whose PIXA license says ai-training=false, comma-separated
+    // among describe, embed, text. Empty = none (v2 behaviour). The flag is also stored in the
+    // vector metadata (ai_training) so a client can filter on it.
+    "AI_TRAINING_FALSE_BLOCKS": "",
+    "MARKET_CUSTOM_JSON_IDS": "",
+    "RPC_FALLBACK_URLS": "https://merlion.surf, https://blockforge.lol, https://pixarex.net, https://boitata.quest, https://pixa-dubai.xyz",
+    "RPC_URL": "https://api.pixagram.com",
+    "SCALER": "xbrz",
+    "STORE_IN_R2": "true",
+    "TAIL_BLOCKS_PER_TICK": "100",
+    "TAIL_IDLE_SECONDS": "3",
+    "UPSCALE_TARGET": "800",
+    // Edit history: walk each author's comment operations during the backfill (post_versions,
+    // first_seen, image_since). Each call scans at most 2000 operations.
+    "HISTORY_BACKFILL": "true",
+    "HISTORY_MAX_CALLS": "300",
+    // /ask planner: rules, llm, or auto (rules; the LLM only when they are unsure).
+    "PLANNER_BACKEND": "auto",
+    // Share of searches whose shown results (first 24) are logged with their features for
+    // learning-to-rank. Each logged search writes up to 24 rows.
+    "RANK_LOG_SAMPLE": "0.25",
+    // Questions about Pixagram itself (/help, and the search box's "help" route) are answered from
+    // this public GitHub repository: its Markdown files, cut at their headings. "off" disables it.
+    // DOCS_PATHS restricts the folders (comma-separated); empty = every Markdown file.
+    "DOCS_REPO": "pixagram-blockchain/information",
+    "DOCS_BRANCH": "main",
+    "DOCS_PATHS": "",
+    // Vectors of the documentation (multilingual: a French question finds an English page).
+    // VEC_DOCS is created with DOCS_EMBED_DIM dimensions, which must be the model's (bge-m3: 1024).
+    "DOCS_EMBED_MODEL": "@cf/baai/bge-m3",
+    "DOCS_EMBED_DIM": "1024",
+    // Cosine above which a page counts as relevant (bge-m3).
+    "DOCS_MIN_SCORE": "0.5",
+    // /help (help/answer.ts) writes from the documentation only, citing it; every sentence is
+    // then checked against the excerpts. Nemotron 3 Super, as v3 (chosen over Llama 3.3 70B there).
+    "SEARCH_HELP_MODEL": "@cf/nvidia/nemotron-3-120b-a12b",
+    // auto: fast (5 excerpts, no reasoning) for questions of up to twelve words, else balanced.
+    "HELP_MODE": "auto",
+    // The cross-encoder on the documentation's excerpts (balanced and deeper, English): not
+    // evaluated on the documentation yet, so off.
+    "HELP_RERANK": "off",
+    // "on": /suggest also proposes searches three people ran on two different days. Shown to
+    // everybody, so a few addresses can plant a phrase of corpus words: decide before turning on.
+    "SUGGEST_POPULAR": "off",
+
+    // ---- v4 (spec §57-58): models, reasoning, retrieval, reranking, verification, tracing ------------
+    // Every model is configuration (src/llm/router.ts); the recommended initial configuration of
+    // the spec (§58), to be confirmed by the benchmark on Pixagram's own questions (§31):
+    // scripts/benchmark.py.
+    "SEARCH_PLANNER_MODEL": "@cf/google/gemma-4-26b-a4b-it",
+    "SEARCH_REASONING_MODEL": "@cf/openai/gpt-oss-120b",
+    // Per complexity band (SIMPLE, NORMAL, COMPLEX, DEEP): e.g. SEARCH_REASONING_MODEL_SIMPLE.
+    "SEARCH_RERANKER_MODEL": "@cf/baai/bge-reranker-base",
+    // Models a public /ask may ask for by name (comma-separated); others need the admin token.
+    "SEARCH_PUBLIC_MODELS": "",
+    "SEARCH_LLM_TIMEOUT_MS": "45000",
+    // auto: by mode (fast none, balanced low, deep medium, expert high); or a level for every mode
+    // that reasons. The visible answer is bounded apart from the reasoning (spec §21).
+    "SEARCH_REASONING": "auto",
+    "SEARCH_MAX_OUTPUT_TOKENS": "8000",
+    // Reasoning tokens allowed per level, on top of the visible answer.
+    "SEARCH_REASONING_TOKENS": "low:4000,medium:8000,high:16000",
+    // Modes: auto follows the complexity band. Public callers up to deep; the search box (/query)
+    // chooses up to balanced by itself.
+    "SEARCH_DEFAULT_MODE": "auto",
+    "SEARCH_MAX_MODE": "deep",
+    "SEARCH_QUERY_MAX_MODE": "balanced",
+    "SEARCH_AUTO_COMPLEXITY": "true",
+    "SEARCH_COMPLEXITY_BANDS": "0.2,0.4,0.65,0.85",
+    // Candidate pools of /ask's retrieval legs in balanced, deep and expert (retrieval.ts depthFor).
+    // Never below v3's own: every matching post is a candidate of the text legs (up to 2000 each),
+    // since counts and "first" questions need them all; the vector legs are bounded by Vectorize
+    // (100 per query; SEARCH_VISUAL_K = queries of the time-sliced image search in deep and expert).
+    "SEARCH_FTS_K": "2000",
+    "SEARCH_CONCEPT_K": "2000",
+    "SEARCH_SEMANTIC_K": "100",
+    "SEARCH_VISUAL_K": "64",
+    // Deleted posts whose recorded titles match (the history leg of deep and expert).
+    "SEARCH_HISTORY_K": "50",
+    // The cross-encoder helps order the evidence the reasoning model reads (balanced and deeper);
+    // /search uses it only when asked (rerank=1). Always blended with the feature ranker's score:
+    // measured offline (README-V4) it is neutral at 0.1–0.2 and costs from 0.3 on (alone: far worse).
+    "SEARCH_RERANK": "true",
+    "SEARCH_RERANK_K": "50",
+    "SEARCH_FINAL_K": "20",
+    "SEARCH_RERANK_BLEND": "0.2",
+    "SEARCH_VERIFY_CLAIMS": "true",
+    "SEARCH_CONFIDENCE_WEIGHTS": "retrieval:0.25,reranking:0.2,agreement:0.2,verification:0.2,model:0.15",
+    "SEARCH_EXPANSION": "rules",
+    // Traces: to callers that ask only with the admin token; a sample is kept in ask_log.
+    "SEARCH_TRACE": "false",
+    "SEARCH_TRACE_SAMPLE": "0.1",
+    "SEARCH_ANSWER_CACHE_TTL": "86400",
+
+    // ---- copy detection (PAPH-X, src/paph; README-V4 "Copy detection") ------------------------------
+    // Shards hold post ids [i·S, (i+1)·S). S is part of each shard's name: choose it once.
+    "PAPH_SHARD_SIZE": "100000",
+    // Per-shard budgets over the defaults of src/paph/budget.ts, e.g. "verify:128,deadline_ms:700".
+    "PAPH_BUDGET_QUERY": "",
+    "PAPH_BUDGET_STAGE": "",
+    // An upload's whole check, from the request's start; its answer is kept a day (86400 s).
+    "PAPH_QUERY_MS": "900",
+    "PAPH_CACHE_TTL": "86400",
+    // Verdicts stored (the API lists copy and up unless min= asks for suspected), and the policy.
+    "PAPH_MIN_VERDICT": "suspected",
+    "PAPH_POLICY": "safe",
+    "PAPH_PHASH_DISTANCE": "10",
+    "PAPH_CHANNEL_K": "24"
+  },
+  // Per client IP (and Cloudflare location): search-like routes / /ask, /help and /search-by-image /
+  // /suggest (one request per pause in typing, several people behind one address). Namespaces of
+  // their own (41xx; v3 has 31xx), so the two stacks do not share budgets. The admin token is exempt.
+  "ratelimits": [
+    { "name": "RL_PUBLIC", "namespace_id": "4101", "simple": { "limit": 120, "period": 60 } },
+    { "name": "RL_HEAVY", "namespace_id": "4102", "simple": { "limit": 20, "period": 60 } },
+    { "name": "RL_SUGGEST", "namespace_id": "4103", "simple": { "limit": 600, "period": 60 } }
+  ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "pixagram-search-v4", "database_id": "REPLACE_D1_ID", "migrations_dir": "migrations" }
+  ],
+  "r2_buckets": [{ "binding": "ART", "bucket_name": "pixagram-art" }],
+  "kv_namespaces": [{ "binding": "CACHE", "id": "REPLACE_KV_ID" }],
+  "vectorize": [
+    { "binding": "VEC", "index_name": "pixagram-art-v4" },
+    { "binding": "VEC_TEXT", "index_name": "pixagram-text-v4" },
+    { "binding": "VEC_DOCS", "index_name": "pixagram-docs-v4" }
+  ],
+  "ai": { "binding": "AI" },
+
+  "queues": {
+    "producers": [{ "binding": "ENRICH_QUEUE", "queue": "pixagram-enrich-v4" }],
+    "consumers": [
+      {
+        "queue": "pixagram-enrich-v4",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 8,
+        // Invocations at once; each works on as many messages at once as the Space computes
+        // embeddings at once (its /health "concurrency": one per CPU), see handleEnrichBatch.
+        "max_concurrency": 2,
+        "dead_letter_queue": "pixagram-enrich-v4-dlq"
+      }
+    ]
+  },
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "INDEXER", "class_name": "ChainIndexer" },
+      // copy detection: one SQLite-backed object per shard (src/paph/shard-do.ts)
+      { "name": "PAPH", "class_name": "PaphShard" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ChainIndexer"] },
+    { "tag": "v2", "new_sqlite_classes": ["PaphShard"] }
+  ],
+
+  "workflows": [
+    { "name": "pixagram-backfill-v4", "binding": "BACKFILL", "class_name": "BackfillWorkflow" }
+  ],
+
+  // 03:17 UTC: vote/payout counters for posts still in their payout window, the background
+  // vector samples (semantic z-scores) and log pruning. Every 10 min: the chain-tail watchdog,
+  // the enrichment sweeper (missing or stale stages are re-enqueued) and the documentation sync
+  // (a conditional request to GitHub: free when nothing changed).
+  "triggers": { "crons": ["17 3 * * *", "*/10 * * * *"] }
+}
