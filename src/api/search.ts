@@ -7,7 +7,9 @@ import { int } from "../env";
 import { cleanText, parseSearchRequest, searchParamsFromBody, type SearchRequest } from "../search/params";
 import { getItem, hydrateOrdered, search } from "../search/service";
 import { duplicates, duplicatesOfHash, similar } from "../search/visual";
-import { ask } from "../search/ask";
+import { ask, answerStyle } from "../search/ask";
+import { searchOverview } from "../search/overview";
+import { richOptions } from "./ask";
 import { isModeRequest, MODES, type Mode } from "../search/query-router";
 import { recordFeedback } from "../search/feedback";
 import { knn } from "../search/vectors";
@@ -23,7 +25,7 @@ import { SIZE_CLASSES } from "../enrich/stats";
 import { knownAuthors } from "../search/context";
 import { routeQuery, routeText, DOCS_KNOWS, type RouteDecision } from "../search/router";
 import { answerHelp } from "../help/answer";
-import { popularEnabled, recordSearcher, suggestExamples, suggestFor, suggestText } from "../search/suggest";
+import { popularEnabled, recordSearcher, suggestAfter, suggestExamples, suggestFor, suggestText } from "../search/suggest";
 import { lexicalDocs } from "../help/retrieve";
 import { bodyObject, edgeCached, execOf, heavyAllowed, isAdmin, MAX_IMAGE_UPLOAD, MAX_QUERY_IMAGE_PIXELS, readBody, readJson, type Bindings } from "./common";
 import { readUploadedImage } from "./image";
@@ -59,10 +61,11 @@ async function helpLinks(env: Env, q: string): Promise<Array<{ title: string; he
   return out;
 }
 
-/** The deepest mode the search box picks by itself (SEARCH_QUERY_MAX_MODE, default balanced). */
-export function queryMaxMode(env: Env): Mode {
-  const m = String(env.SEARCH_QUERY_MAX_MODE ?? "balanced");
-  return (MODES as string[]).includes(m) ? (m as Mode) : "balanced";
+/** The deepest mode the search box picks by itself (SEARCH_QUERY_MAX_MODE; by default deep for rich answers, balanced for brief ones, as v4). */
+export function queryMaxMode(env: Env, style: "rich" | "brief" = "brief"): Mode {
+  const dflt: Mode = style === "rich" ? "deep" : "balanced";
+  const m = String(env.SEARCH_QUERY_MAX_MODE ?? dflt);
+  return (MODES as string[]).includes(m) ? (m as Mode) : dflt;
 }
 
 export function registerSearch(app: Hono<Bindings>): void {
@@ -121,6 +124,8 @@ export function registerSearch(app: Hono<Bindings>): void {
     }
     const res = await search(c.env, req, exec);
     if (notes.length) res.notes = [...(res.notes ?? []), ...notes];
+    // overview=1: a text overview of the page (v4.8), in the language asked for (lang=) or the query's
+    if (/^(1|true|yes|on)$/i.test(sp.get("overview") ?? "")) res.overview = searchOverview(res, sp.get("lang") ?? planQuery(req.q, { mode: "search" }).lang);
     // who ran it, for the popular searches /suggest may show (SUGGEST_POPULAR=on): a page-one text
     // search in the default safe mode that found something
     if (popularEnabled(c.env) && req.q.trim() && !req.cursor && req.nsfw === "exclude" && res.items.length > 0) {
@@ -150,10 +155,15 @@ export function registerSearch(app: Hono<Bindings>): void {
     // results=0: the caller runs its own search (the search box does); no search here, and no
     // search logged twice
     const withResults = sp.get("results") !== "0";
+    // v4.8: rich answers (style, text, length, defer), and a text overview with every search
+    const rich = richOptions((k) => sp.get(k));
+    const richStyle = answerStyle(c.env, rich.style) === "rich";
+    const overviewOf = (results: Awaited<ReturnType<typeof search>> | null, lang: string) => (richStyle && results ? searchOverview(results, lang) : undefined);
     const maybeSearch = async () => (withResults ? runSearch() : null);
     if (!q || sp.get("cursor") || forced === "search") {
       const reason = !q ? "nothing typed: browse" : sp.get("cursor") ? "next page" : "route=search";
-      return c.json({ q, route: "search", reason, results: await maybeSearch(), took_ms: Date.now() - t0 });
+      const results = await maybeSearch();
+      return c.json({ q, route: "search", reason, results, overview: q && !sp.get("cursor") ? overviewOf(results, planQuery(q, { mode: "search" }).lang) : undefined, took_ms: Date.now() - t0 });
     }
     const plan = planQuery(q, { mode: "ask", authors: await knownAuthors(c.env) });
     let decision: RouteDecision;
@@ -178,7 +188,8 @@ export function registerSearch(app: Hono<Bindings>): void {
     const fallback = async (e: unknown) => {
       console.error("query answer failed", decision.route, e);
       notes.push(`the ${decision.route} answer failed (${e instanceof Error ? e.message : String(e)}): showing results`);
-      return c.json({ ...meta, route: "search", results: await maybeSearch(), took_ms: Date.now() - t0 });
+      const results = await maybeSearch();
+      return c.json({ ...meta, route: "search", results, overview: overviewOf(results, plan.lang), took_ms: Date.now() - t0 });
     };
     const askedMode = sp.get("mode");
     if (decision.route === "ask") {
@@ -192,30 +203,31 @@ export function registerSearch(app: Hono<Bindings>): void {
             nsfw: req.nsfw,
             limit: Math.min(req.limit, 24),
             mode: isModeRequest(askedMode) ? askedMode : undefined,
-            ceiling: queryMaxMode(c.env),
+            ceiling: queryMaxMode(c.env, richStyle ? "rich" : "brief"),
             admin: isAdmin(c),
+            ...rich,
           },
           exec,
         );
         // nothing found (null), or a zero ("0 cats", "0 similar artworks"): show what a search finds
         const results = answer.answer === null || answer.answer === 0 ? await maybeSearch() : undefined;
-        return c.json({ ...meta, answer, results, took_ms: Date.now() - t0 });
+        return c.json({ ...meta, answer, results, overview: results ? overviewOf(results, plan.lang) : undefined, took_ms: Date.now() - t0 });
       } catch (e) {
         return fallback(e);
       }
     }
     if (decision.route === "help") {
       try {
-        const answer = await answerHelp(c.env, q, { lang: plan.lang });
+        const answer = await answerHelp(c.env, q, { lang: plan.lang, style: rich.style, length: rich.length, ...(richStyle && isModeRequest(askedMode) && askedMode !== "auto" && askedMode !== "v3" ? { mode: askedMode } : {}) });
         const results = answer.status === "answered" || answer.status === "excerpts" ? undefined : await maybeSearch();
-        return c.json({ ...meta, answer, results, took_ms: Date.now() - t0 });
+        return c.json({ ...meta, answer, results, overview: results ? overviewOf(results, plan.lang) : undefined, took_ms: Date.now() - t0 });
       } catch (e) {
         return fallback(e);
       }
     }
     const showLinks = decision.signals.platform.length > 0 || decision.signals.platformName;
     const [results, help_links] = await Promise.all([maybeSearch(), showLinks ? helpLinks(c.env, q).catch(() => []) : Promise.resolve(undefined)]);
-    return c.json({ ...meta, results, help_links: help_links?.length ? help_links : undefined, took_ms: Date.now() - t0 });
+    return c.json({ ...meta, results, overview: overviewOf(results, plan.lang), help_links: help_links?.length ? help_links : undefined, took_ms: Date.now() - t0 });
   });
 
   /**
@@ -229,6 +241,21 @@ export function registerSearch(app: Hono<Bindings>): void {
     const q = suggestText(sp.get("q"));
     const lang = vocabLang(sp.get("lang"));
     const limit = Math.max(1, Math.min(12, int(sp.get("limit") ?? undefined, 8)));
+    // after=<query_id> (v4.8): the follow-up questions and searches of that answer come first, so
+    // the box continues the conversation; the rest of the list is the usual one
+    const after = (sp.get("after") ?? "").trim();
+    if (after) {
+      const key = `suggest/after/${encodeURIComponent(after)}/${lang}/${limit}/${encodeURIComponent(q)}`;
+      return edgeCached(c, key, 30, async () => {
+        const mine = await suggestAfter(c.env, after, q, Math.min(limit, 4));
+        if (!q.trim()) {
+          const ex = await suggestExamples(c.env, lang);
+          return { ...ex, examples: [...mine, ...ex.examples.filter((e) => !mine.some((m) => m.text === e.text))].slice(0, Math.max(limit, ex.examples.length)) };
+        }
+        const rest = await suggestFor(c.env, q, { lang, limit });
+        return { ...rest, suggestions: [...mine, ...rest.suggestions.filter((e) => !mine.some((m) => m.text === e.text))].slice(0, limit) };
+      });
+    }
     if (!q.trim()) return edgeCached(c, `suggest/examples/${lang}`, 300, () => suggestExamples(c.env, lang));
     return edgeCached(c, `suggest/q/${lang}/${limit}/${encodeURIComponent(q)}`, 60, () => suggestFor(c.env, q, { lang, limit }));
   });

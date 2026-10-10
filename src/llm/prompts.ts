@@ -7,14 +7,22 @@
 // card. The output schema is passed as the request's JSON schema and described in words too, for
 // models without a JSON mode. PROMPT_VERSION is part of every cache key and of every answer's
 // recorded versions (spec §50-51): change it whenever a prompt changes.
+//
+// Tasks:
+//   answer   v4's short explanation (one to three sentences) of the index's result
+//   compose  v4.8's long-form answer: the same direct answer, then a body of several paragraphs,
+//            a written reasoning trail the reader can check (thinking), caveats, follow-up
+//            questions and related searches — every sentence cited, every sentence verified
+//            afterwards (search/compose.ts); the index's result still comes first
+//   help     an answer from the documentation excerpts (/help)
 
 import type { Lang } from "../lib/text";
 
-export const PROMPT_VERSION = "v4.2";
+export const PROMPT_VERSION = "v4.8";
 
 export const LANG_NAME: Record<string, string> = { en: "English", fr: "French", de: "German", es: "Spanish", it: "Italian", ja: "Japanese", zh: "Chinese", ko: "Korean", ru: "Russian" };
 
-export type ReasoningTask = "answer" | "help";
+export type ReasoningTask = "answer" | "compose" | "help";
 
 /** The rules every reasoning call carries. */
 export const SYSTEM_POLICY = [
@@ -33,14 +41,30 @@ export const SYSTEM_POLICY = [
   "10. Give a short rationale (one or two sentences) saying which evidence decided the answer. Do not write out your private reasoning.",
 ].join("\n");
 
+const CARDS = [
+  "Evidence cards: \"artwork\" and \"post\" cards describe posts (created_at, first_seen_at, first_seen_in, tags, concepts, an AI caption, votes);",
+  "\"result\" cards hold exact answers computed by the index (first, latest, counts, comparisons, history); \"conflict\" cards report evidence that disagrees.",
+];
+
 const TASK: Record<ReasoningTask, string> = {
   answer: [
     "Task: answer the user's question about Pixagram artworks, artists and their history.",
-    "Evidence cards: \"artwork\" and \"post\" cards describe posts (created_at, first_seen_at, first_seen_in, tags, concepts, an AI caption, votes);",
-    "\"result\" cards hold exact answers computed by the index (first, latest, counts, comparisons, history); \"conflict\" cards report evidence that disagrees.",
+    ...CARDS,
     "When a result card answers the question, the reader sees its text first and your answer after it, as its explanation: begin with the result's own value",
     "(\"Yes\" or \"No\" first when the result is yes or no; the same @account, date, number or title), never another value, then say what it rests on and what to keep in mind (ties, lower bounds, reposts, inferred histories).",
     "Accounts are always written with @ (\"@alice\"), never as bare names; dates as YYYY-MM-DD; titles in quotes. Keep the answer to one to three sentences.",
+  ].join("\n"),
+  compose: [
+    "Task: write a complete, well-organised answer to the user's question about Pixagram artworks, artists and their history, from the evidence alone.",
+    ...CARDS,
+    "The reply has these parts:",
+    "- answer: the direct answer in one to three sentences. When a result card answers the question, the reader sees its text first and yours after it: begin with the result's own value (\"Yes\" or \"No\" first when the result is yes or no; the same @account, date, number or title), never another value.",
+    "- body: the full answer in Markdown, about {words} words, in several short paragraphs. Use a bullet list for enumerations (artworks, dates, authors, tags) and a line starting with \"### \" only when a heading helps. Say what the evidence shows: the artworks (titles, authors, dates, tags, what their captions describe), how they relate (the first and later posts, reposts, edits, deletions, votes), the patterns across them, and what the answer rests on. Every sentence that states a fact ends with the ids of the cards it comes from, in brackets: [E12] [R1]. A sentence that cites nothing is read as your interpretation. Never pad: when the evidence is thin, the body is short.",
+    "- thinking: 3 to 8 numbered steps a reader can check: what the question asks, which cards decide it, how they connect, what remains uncertain. Each step cites its cards. This is a written account for the reader, not your private reasoning.",
+    "- caveats: ties, lower bounds, inferred histories, deleted posts, captions written by a model, what the evidence cannot tell. An empty list when there is none.",
+    "- follow_ups: 3 to 6 questions the reader may ask next, each answerable from the Pixagram index about the accounts, titles, subjects, tags, colours or dates in the evidence: who posted something, when, how many, the first or the latest, the most voted, whether a post was reposted or edited, a comparison between accounts named in the evidence. One plain question per entry, in {language}.",
+    "- searches: 2 to 4 short searches for Pixagram's search box (a subject, a colour and a subject, a tag), made of words that occur in the evidence.",
+    "Accounts are always written with @ (\"@alice\"), never as bare names; dates as YYYY-MM-DD; titles in quotes.",
   ].join("\n"),
   help: [
     "Task: answer the user's question about the Pixagram platform from the numbered excerpts of its official documentation (cards of type \"doc\").",
@@ -50,37 +74,72 @@ const TASK: Record<ReasoningTask, string> = {
   ].join("\n"),
 };
 
-/** JSON schema of the reasoning reply. */
+const CLAIMS_SCHEMA = {
+  type: "array",
+  description: "The factual statements the answer rests on, each with the evidence ids that support it.",
+  items: {
+    type: "object",
+    required: ["text", "evidence", "kind"],
+    properties: {
+      text: { type: "string" },
+      evidence: { type: "array", items: { type: "string" } },
+      kind: { type: "string", enum: ["fact", "inference"] },
+      confidence: { type: "number" },
+    },
+  },
+} as const;
+
+/** JSON schema of the reasoning reply (tasks answer and help). */
 export const REPLY_SCHEMA = {
   type: "object",
   required: ["status", "answer", "claims", "rationale"],
   properties: {
     status: { type: "string", enum: ["answered", "insufficient_evidence", "conflict"] },
     answer: { type: "string", description: "The direct answer, one to three sentences, in the language asked for." },
-    claims: {
-      type: "array",
-      description: "The factual statements the answer rests on, each with the evidence ids that support it.",
-      items: {
-        type: "object",
-        required: ["text", "evidence", "kind"],
-        properties: {
-          text: { type: "string" },
-          evidence: { type: "array", items: { type: "string" } },
-          kind: { type: "string", enum: ["fact", "inference"] },
-          confidence: { type: "number" },
-        },
-      },
-    },
+    claims: CLAIMS_SCHEMA,
     rationale: { type: "string", description: "One or two sentences: which evidence decided the answer." },
     confidence: { type: "number", description: "0 to 1: how well the evidence supports the answer." },
     conflicts: { type: "array", items: { type: "object", properties: { evidence: { type: "array", items: { type: "string" } }, about: { type: "string" } } } },
   },
 } as const;
 
-const SCHEMA_WORDS =
-  'Reply with one JSON object: {"status": "answered" | "insufficient_evidence" | "conflict", "answer": string, ' +
-  '"claims": [{"text": string, "evidence": [ids], "kind": "fact" | "inference", "confidence": number}], "rationale": string, "confidence": number, ' +
-  '"conflicts": [{"evidence": [ids], "about": string}]}. JSON only, no markdown.';
+/** JSON schema of the long-form reply (task compose). */
+export const COMPOSE_SCHEMA = {
+  type: "object",
+  required: ["status", "answer", "body", "thinking", "claims", "rationale"],
+  properties: {
+    status: REPLY_SCHEMA.properties.status,
+    answer: REPLY_SCHEMA.properties.answer,
+    body: { type: "string", description: "The full answer in Markdown: several short paragraphs, bullet lists for enumerations, every factual sentence ending with the ids of its cards in brackets." },
+    thinking: { type: "array", items: { type: "string" }, description: "3 to 8 numbered steps a reader can check, each citing its cards." },
+    caveats: { type: "array", items: { type: "string" } },
+    follow_ups: { type: "array", items: { type: "string" }, description: "3 to 6 questions the reader may ask next, answerable from the Pixagram index." },
+    searches: { type: "array", items: { type: "string" }, description: "2 to 4 short searches for the search box." },
+    claims: CLAIMS_SCHEMA,
+    rationale: REPLY_SCHEMA.properties.rationale,
+    confidence: REPLY_SCHEMA.properties.confidence,
+    conflicts: REPLY_SCHEMA.properties.conflicts,
+  },
+} as const;
+
+/** The reply schema of a task. */
+export const schemaFor = (task: ReasoningTask) => (task === "compose" ? COMPOSE_SCHEMA : REPLY_SCHEMA);
+
+const SCHEMA_WORDS: Record<ReasoningTask, string> = {
+  answer:
+    'Reply with one JSON object: {"status": "answered" | "insufficient_evidence" | "conflict", "answer": string, ' +
+    '"claims": [{"text": string, "evidence": [ids], "kind": "fact" | "inference", "confidence": number}], "rationale": string, "confidence": number, ' +
+    '"conflicts": [{"evidence": [ids], "about": string}]}. JSON only, no markdown.',
+  compose:
+    'Reply with one JSON object: {"status": "answered" | "insufficient_evidence" | "conflict", "answer": string, "body": string (Markdown), ' +
+    '"thinking": [string], "caveats": [string], "follow_ups": [string], "searches": [string], ' +
+    '"claims": [{"text": string, "evidence": [ids], "kind": "fact" | "inference", "confidence": number}], "rationale": string, "confidence": number, ' +
+    '"conflicts": [{"evidence": [ids], "about": string}]}. JSON only (the Markdown goes inside the "body" string).',
+  help:
+    'Reply with one JSON object: {"status": "answered" | "insufficient_evidence" | "conflict", "answer": string, ' +
+    '"claims": [{"text": string, "evidence": [ids], "kind": "fact" | "inference", "confidence": number}], "rationale": string, "confidence": number, ' +
+    '"conflicts": [{"evidence": [ids], "about": string}]}. JSON only, no markdown.',
+};
 
 /** One card as one line of compact JSON: no empty fields, numbers rounded, long texts cut. */
 export function renderCard(card: Record<string, unknown>): string {
@@ -113,12 +172,15 @@ export interface PromptInput {
   lang: Lang;
   /** facts about the evidence the model must know ("counts are lower bounds", "history inferred") */
   context?: string[];
+  /** compose: the length of the body, in words */
+  words?: number;
 }
 
 /** The messages of a reasoning call. Deterministic: the same input gives the same messages. */
 export function reasoningMessages(p: PromptInput): Array<{ role: "system" | "user"; content: string }> {
   const language = LANG_NAME[p.lang] ?? "the language of the question";
-  const system = [SYSTEM_POLICY, "", TASK[p.task], "", `Write the answer, the claims and the rationale in ${language}.`, SCHEMA_WORDS].join("\n");
+  const task = TASK[p.task].replace(/\{words\}/g, String(p.words ?? 250)).replace(/\{language\}/g, language);
+  const system = [SYSTEM_POLICY, "", task, "", `Write the answer, the claims and the rationale in ${language}.`, SCHEMA_WORDS[p.task]].join("\n");
   const evidence = p.cards.length ? p.cards.map(renderCard).join("\n") : "(no evidence was found)";
   const user = [
     `Question: ${p.question}`,

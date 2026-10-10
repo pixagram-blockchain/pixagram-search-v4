@@ -8,7 +8,7 @@ import { installGitHub } from "./harness/github";
 import { artCorpus, GALLERY } from "./harness/corpus";
 import { singular, tokens } from "../src/lib/text";
 import { syncDocs } from "../src/docs/sync";
-import { answerHelp, answerSegments, checkHelpAnswer, helpMode } from "../src/help/answer";
+import { answerHelp, answerSegments, checkHelpAnswer, HELP_PROMPT_VERSION, helpMode } from "../src/help/answer";
 import type { DocHit } from "../src/help/retrieve";
 import { app } from "../src/api";
 
@@ -142,7 +142,7 @@ describe("help answers checked sentence by sentence", () => {
     expect(r.claims!.map((c) => c.status)).toEqual(["supported", "unsupported"]);
     expect(r.notes.join(" ")).toContain("1 sentence(s) removed");
     expect(r.confidence).toBeLessThan(r.sources[0].score);
-    expect(r).toMatchObject({ mode: "fast", reasoning: "none", versions: { docs_commit: "a".repeat(40), help_model: HELP, prompt: "h4.1", reranker: null } });
+    expect(r).toMatchObject({ mode: "fast", reasoning: "none", versions: { docs_commit: "a".repeat(40), help_model: HELP, prompt: HELP_PROMPT_VERSION, reranker: null } });
     const log = await env.DB.prepare("SELECT status, mode, model, egs FROM help_log ORDER BY id DESC LIMIT 1").first<any>();
     expect(log).toEqual({ status: "answered", mode: "fast", model: HELP, egs: 0.5 });
   });

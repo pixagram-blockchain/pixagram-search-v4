@@ -10,11 +10,13 @@ states the index's own result (what /ask requires before showing a model's expla
 with the question set's expected answer, abstention, reasoning/output tokens, cost, and latency.
 
     ADMIN_TOKEN=… python3 scripts/benchmark.py https://pixagram-search-v4.<you>.workers.dev \
-        [--models @cf/openai/gpt-oss-120b,@cf/nvidia/nemotron-3-120b-a12b,@cf/google/gemma-4-26b-a4b-it]
+        [--models @cf/zai-org/glm-5.3-flash,@cf/zai-org/glm-5.3,@cf/openai/gpt-oss-120b]
         [--reasoning medium] [--limit 60] [--types temporal,comparative,multi_hop,semantic,factual] [--out bench.json]
+        [--task compose --words 250]   # v4.8: the long-form reply; adds the body's grounding (sentences kept) and length
 
 Costs Workers AI tokens (about one context of 2–6k tokens per question and model). The default
-models are the spec's §58 list; the question sample is drawn evenly from the given categories.
+models are v4.8.1's (the deployed GLMs, DeepSeek V4 Flash, gpt-oss-120b, Qwen3.8); the question
+sample is drawn evenly from the given categories.
 """
 from __future__ import annotations
 
@@ -31,12 +33,15 @@ import time
 import urllib.error
 import urllib.request
 
+# v4.8.1: the deployed models (GLM-5.3-Flash, GLM-5.3) against the strongest alternatives Workers
+# AI serves in October 2026 and v4's gpt-oss-120b; v4's list was gpt-oss-120b, Nemotron 3,
+# Gemma 4, Llama 3.3 70B and Kimi K2.6 (--models takes any ids the stack can call).
 DEFAULT_MODELS = [
+    "@cf/zai-org/glm-5.3-flash",
+    "@cf/zai-org/glm-5.3",
+    "@cf/deepseek-ai/deepseek-v4-flash-0731",
     "@cf/openai/gpt-oss-120b",
-    "@cf/nvidia/nemotron-3-120b-a12b",
-    "@cf/google/gemma-4-26b-a4b-it",
-    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "@cf/moonshotai/kimi-k2.6",
+    "@cf/qwen/qwen3.8-27b",
 ]
 
 YES = re.compile(r"^\s*(yes|oui|ja|s[ií])\b", re.I)
@@ -92,7 +97,9 @@ def main() -> int:
     ap.add_argument("--dataset", default="src/evaluation/datasets/questions.jsonl")
     ap.add_argument("--models", default=",".join(DEFAULT_MODELS))
     ap.add_argument("--reasoning", default="medium", choices=["none", "low", "medium", "high"])
-    ap.add_argument("--max-output-tokens", type=int, default=2000)
+    ap.add_argument("--max-output-tokens", type=int, default=0, help="default 2000 (answer) or 3000 (compose)")
+    ap.add_argument("--task", default="answer", choices=["answer", "compose"], help="compose: the v4.8 long-form reply (body, reasoning trail, follow-ups)")
+    ap.add_argument("--words", type=int, default=250, help="compose: the body's target length")
     ap.add_argument("--limit", type=int, default=60)
     ap.add_argument("--types", default="factual,temporal,comparative,multi_hop,semantic,multilingual,adversarial")
     ap.add_argument("--mode", default="deep", choices=["balanced", "deep", "expert"])
@@ -130,7 +137,7 @@ def main() -> int:
     runs: dict[str, list] = {m: [] for m in models}
     for m in models:
         for i, (x, ctx) in enumerate(contexts):
-            body = {"question": ctx["question"], "lang": ctx["lang"], "cards": ctx["cards"], "context": ctx["context"], "shown": ctx.get("shown", []), "model": m, "reasoning": a.reasoning, "max_output_tokens": a.max_output_tokens}
+            body = {"question": ctx["question"], "lang": ctx["lang"], "cards": ctx["cards"], "context": ctx["context"], "shown": ctx.get("shown", []), "model": m, "reasoning": a.reasoning, "max_output_tokens": a.max_output_tokens or (3000 if a.task == "compose" else 2000), "task": a.task, "words": a.words}
             t0 = time.time()
             st, r = post(f"{base}/admin/ask/reason", body, token)
             r = r if isinstance(r, dict) else {"error": str(r)}
@@ -142,7 +149,8 @@ def main() -> int:
             if (i + 1) % 20 == 0:
                 print(f"  {m}: {i + 1}/{len(contexts)}", file=sys.stderr)
 
-    print(f"\n{'model':44}{'ok':>5}{'EGS':>7}{'cite':>7}{'rej':>6}{'states':>7}{'agree':>7}{'abst':>6}{'in tok':>9}{'out tok':>9}{'$/100q':>9}{'P50 ms':>8}{'P95 ms':>8}")
+    compose = a.task == "compose"
+    print(f"\n{'model':44}{'ok':>5}{'EGS':>7}{'cite':>7}{'rej':>6}{'states':>7}{'agree':>7}{'abst':>6}{'in tok':>9}{'out tok':>9}{'$/100q':>9}{'P50 ms':>8}{'P95 ms':>8}" + ("  body EGS  words  kept%" if compose else ""))
     table = {}
     for m, rs in runs.items():
         good = [r for r in rs if not r.get("error")]
@@ -160,9 +168,18 @@ def main() -> int:
         lat = [r.get("model_ms") or 0 for r in good]
         table[m] = {"ok": len(good), "errors": len(rs) - len(good), "egs": egs, "citation_accuracy": cite, "rejected": rejected, "states_result": (sum(states) / len(states)) if states else None, "agreement": (sum(agree) / len(agree)) if agree else None, "abstained": abst, "input_tokens": tin, "output_tokens": tout, "cost_usd": cost, "cost_per_100": 100 * cost / max(1, len(good)), "p50_ms": pct(lat, 50), "p95_ms": pct(lat, 95)}
         t = table[m]
-        print(f"{m:44}{t['ok']:>5}{t['egs']:>7.3f}{t['citation_accuracy']:>7.3f}{t['rejected']:>6}{(t['states_result'] or 0):>7.3f}{(t['agreement'] or 0):>7.3f}{t['abstained']:>6}{t['input_tokens']:>9}{t['output_tokens']:>9}{t['cost_per_100']:>9.4f}{t['p50_ms']:>8}{t['p95_ms']:>8}")
+        extra = ""
+        if compose:
+            # the long body: its sentences' grounding, its length once the unsupported sentences are out, the share kept
+            bodies = [r["body"] for r in good if r.get("body")]
+            b_egs = statistics.fmean(b["egs"] for b in bodies) if bodies else 0
+            b_words = statistics.fmean(b["words"] for b in bodies) if bodies else 0
+            kept = statistics.fmean((b["sentences"] - b["removed"]) / b["sentences"] for b in bodies if b["sentences"]) if bodies else 0
+            t.update({"body_egs": b_egs, "body_words": b_words, "body_kept": kept})
+            extra = f"{b_egs:>10.3f}{b_words:>7.0f}{100 * kept:>6.0f}%"
+        print(f"{m:44}{t['ok']:>5}{t['egs']:>7.3f}{t['citation_accuracy']:>7.3f}{t['rejected']:>6}{(t['states_result'] or 0):>7.3f}{(t['agreement'] or 0):>7.3f}{t['abstained']:>6}{t['input_tokens']:>9}{t['output_tokens']:>9}{t['cost_per_100']:>9.4f}{t['p50_ms']:>8}{t['p95_ms']:>8}{extra}")
     if a.out:
-        json.dump({"models": table, "reasoning": a.reasoning, "questions": [x["id"] for x, _ in contexts], "runs": runs}, open(a.out, "w"), indent=1)
+        json.dump({"models": table, "reasoning": a.reasoning, "task": a.task, "questions": [x["id"] for x, _ in contexts], "runs": runs}, open(a.out, "w"), indent=1)
     return 0
 
 

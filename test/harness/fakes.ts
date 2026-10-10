@@ -181,6 +181,11 @@ export function makeEnv(over: Partial<Env> & { migrationsDir?: string; db?: Fake
     EMBED_DIM: "16",
     VLM_BACKEND: "off",
     STORE_IN_R2: "true",
+    // v4's answers (one sentence, the model only where v4 called it): the v3 and v4 suites assert
+    // them field for field. The deployed default is rich (wrangler.jsonc); test/v4-rich.test.ts
+    // runs with SEARCH_ANSWER_STYLE=rich and HELP_STYLE=rich.
+    SEARCH_ANSWER_STYLE: "brief",
+    HELP_STYLE: "brief",
     ...vars,
     _db: db,
     _kv: kv,

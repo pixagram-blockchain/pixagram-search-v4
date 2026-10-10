@@ -71,17 +71,20 @@ describe("the deployed configuration", () => {
     return readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8").match(new RegExp(`"${name}":\\s*"([^"]+)"`))?.[1];
   };
 
-  it("the help and planner models wrangler.jsonc deploys (v4: Nemotron 3 for help, Gemma 4 for planning) are sent with reasoning off and the {name, schema} JSON shape", async () => {
+  it("the help and planner models wrangler.jsonc deploys (v4.8.1: GLM-5.3-Flash for help, Gemma 4 for planning) are sent with the least reasoning they allow and the {name, schema} JSON shape", async () => {
     const vars: Record<string, string | undefined> = {};
     for (const name of ["HELP_MODEL", "PLANNER_MODEL", "SEARCH_HELP_MODEL", "SEARCH_PLANNER_MODEL"]) vars[name] = await deployed(name);
     const env = makeEnv(vars as any);
-    expect(modelFor(env, "help")).toBe(NEMOTRON);
+    expect(modelFor(env, "help")).toBe("@cf/zai-org/glm-5.3-flash");
     expect(modelFor(env, "planner")).toBe("@cf/google/gemma-4-26b-a4b-it");
+    // the planner plans with reasoning off; GLM cannot switch it off and runs at its lowest effort
+    expect(noThinking(modelFor(env, "planner"))).toEqual({ chat_template_kwargs: { enable_thinking: false } });
+    expect(noThinking(modelFor(env, "help"))).toEqual({ reasoning_effort: "low" });
     for (const [role, format] of [["help", "help_answer"], ["planner", "search_plan"]] as const) {
-      const model = modelFor(env, role);
-      expect(noThinking(model)).toEqual({ chat_template_kwargs: { enable_thinking: false } });
-      expect(jsonFormat(model, format, {})).toEqual({ type: "json_schema", json_schema: { name: format, schema: {} } });
+      expect(jsonFormat(modelFor(env, role), format, {})).toEqual({ type: "json_schema", json_schema: { name: format, schema: {} } });
     }
+    // Nemotron 3, the v4 help model, keeps its shape for a stack that stays on it
+    expect(noThinking(NEMOTRON)).toEqual({ chat_template_kwargs: { enable_thinking: false } });
   });
 
   it("the search box as deployed: a question the rules cannot plan is planned by the deployed planner (v4: Gemma 4), once, its reply read as JSON or as a stream", async () => {

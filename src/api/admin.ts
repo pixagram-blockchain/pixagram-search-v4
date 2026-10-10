@@ -3,7 +3,7 @@
 // benchmark, the configured models, and the learning-to-rank and fine-tuning exports.
 
 import { Hono } from "hono";
-import { ALL_STAGES, BLOG_STAGES, bool, int, type Stage } from "../env";
+import { ALL_STAGES, BLOG_STAGES, bool, int, num, type Stage } from "../env";
 import { exportPairs, exportSft, exportTraining, getWeights, setWeights } from "../search/feedback";
 import { refreshBackground } from "../search/background";
 import { planQuery } from "../search/planner";
@@ -21,7 +21,8 @@ import { sweep } from "../enrich/sweeper";
 import { knownAuthors } from "../search/context";
 import { answerHelp } from "../help/answer";
 import { docsStatus, syncDocs } from "../docs/sync";
-import { embedPendingChunks } from "../docs/vectors";
+import { docsEmbedModel, embedPendingChunks } from "../docs/vectors";
+import { retrieveDocs } from "../help/retrieve";
 import { isReasoningLevel } from "../llm/provider";
 import { endpoints, isModelId, KNOWN_MODELS, KNOWN_PRICES, modelSpec } from "../llm/model";
 import { configuredReasoningModels, modelFor } from "../llm/router";
@@ -166,7 +167,7 @@ admin.get("/stats", async (c) => {
     config: {
       semantic: embeddingEnabled(c.env), embed_model: c.env.EMBED_MODEL, embed_dim: int(c.env.EMBED_DIM, 768), embed_views: embedLabel(c.env),
       text_vectors: bool(c.env.TEXT_VECTORS, true) && !!c.env.VEC_TEXT, calibration: await getCalibration(c.env),
-      vlm: c.env.VLM_BACKEND, planner: c.env.PLANNER_BACKEND ?? "auto", scaler: c.env.SCALER, store_in_r2: bool(c.env.STORE_IN_R2, true),
+      vlm: c.env.VLM_BACKEND, vlm_model: (c.env.VLM_BACKEND ?? "gemma").toLowerCase() === "chat" ? (c.env.VLM_MODEL ?? null) : undefined, planner: c.env.PLANNER_BACKEND ?? "auto", scaler: c.env.SCALER, store_in_r2: bool(c.env.STORE_IN_R2, true),
       ai_training_false_blocks: c.env.AI_TRAINING_FALSE_BLOCKS ?? (bool(c.env.RESPECT_AI_TRAINING_FLAG, false) ? "describe" : ""),
       models: { planner: modelFor(c.env, "planner"), help: modelFor(c.env, "help"), reranker: modelFor(c.env, "reranker"), reasoning: configuredReasoningModels(c.env) },
     },
@@ -256,6 +257,30 @@ admin.post("/docs/reembed", async (c) => {
 });
 
 /**
+ * What the documentation retrieval finds for a question, without the model: each chunk's lexical
+ * coverage, raw cosine and combined score (?q=…&k=10). The tool for setting DOCS_MIN_SCORE after
+ * an embedding-model change: ask a dozen questions the documentation answers and a few it does
+ * not, and put the line between the cosines of the right chunks and those of the wrong ones.
+ */
+admin.get("/debug/docs", async (c) => {
+  const u = new URL(c.req.url);
+  const q = (u.searchParams.get("q") ?? "").trim();
+  if (!q) return c.json({ error: "q is required" }, 400);
+  const r = await retrieveDocs(c.env, q, { k: Math.min(50, int(u.searchParams.get("k") ?? undefined, 10)) });
+  return c.json({
+    question: q,
+    embed_model: docsEmbedModel(c.env),
+    min_score: num(c.env.DOCS_MIN_SCORE, 0.5),
+    relevant: r.relevant,
+    best: r.best,
+    degraded: r.degraded,
+    terms: r.terms,
+    notes: r.notes,
+    hits: r.hits.map((h) => ({ id: h.id, path: h.path, heading: h.heading, lexical: h.lexical, cosine: h.cosine, score: h.score, excerpt: h.text.length > 160 ? `${h.text.slice(0, 157).trimEnd()}…` : h.text })),
+  });
+});
+
+/**
  * /help answered by another model, to compare models on the same documentation before changing
  * HELP_MODEL: ?q=…&model=@cf/nvidia/nemotron-3-120b-a12b (&mode=…&reasoning=…). Not recorded in the help log.
  */
@@ -331,9 +356,10 @@ admin.post("/ask/context", async (c) => {
 });
 
 /**
- * One model on a frozen context: POST {question, lang, cards, context, shown?, model, reasoning?, max_output_tokens?, strict?}
+ * One model on a frozen context: POST {question, lang, cards, context, shown?, model, reasoning?, max_output_tokens?, strict?, task?: "answer" | "compose", words?}
  * → the reply, its claims verified against the same cards, grounding, whether it states the
- * index's answer (agreement), tokens, cost and latency.
+ * index's answer (agreement), tokens, cost and latency; with task compose (v4.8) the long body's
+ * sentence checks (body) and the reasoning trail's (thinking) too.
  * Never cached, never logged: for comparing models on exactly the same input.
  */
 admin.post("/ask/reason", async (c) => {
@@ -346,7 +372,8 @@ admin.post("/ask/reason", async (c) => {
   const lang = (typeof b.lang === "string" ? b.lang : guessLang(question)) as Lang;
   const context = Array.isArray(b.context) ? (b.context as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 20) : [];
   const shown = Array.isArray(b.shown) ? (b.shown as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 12) : [];
-  const run = await runOnContext(c.env, { question, lang, cards, context, shown }, model, { reasoning: isReasoningLevel(b.reasoning) ? b.reasoning : "medium", maxTokens: Number(b.max_output_tokens) || 2000, strict: !!b.strict });
+  const task = b.task === "compose" ? "compose" : "answer";
+  const run = await runOnContext(c.env, { question, lang, cards, context, shown }, model, { reasoning: isReasoningLevel(b.reasoning) ? b.reasoning : "medium", maxTokens: Number(b.max_output_tokens) || (task === "compose" ? 3000 : 2000), strict: !!b.strict, task, words: Number(b.words) || undefined });
   return run.error ? c.json(run, 502) : c.json(run);
 });
 

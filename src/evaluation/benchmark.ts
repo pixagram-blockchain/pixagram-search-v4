@@ -14,6 +14,7 @@ import { agreesWithResult, verifyClaims, type ClaimVerification } from "../searc
 import { reasoningModel, UnusableReply } from "../llm/reasoning";
 import type { ReasoningLevel } from "../llm/provider";
 import { PROMPT_VERSION } from "../llm/prompts";
+import { countWords, verifyList, verifyMarkdown } from "../search/compose";
 
 export interface FrozenContext {
   question: string;
@@ -66,24 +67,32 @@ export interface ModelRun {
   error?: string;
   unusable?: boolean;
   notes: string[];
+  /** task compose (v4.8): the body's sentence checks and length, the reasoning trail's */
+  task?: "answer" | "compose";
+  body?: { words: number; sentences: number; removed: number; egs: number; citation_accuracy: number } | null;
+  thinking?: { kept: number; removed: number } | null;
 }
 
 /** One model on a frozen context: never cached, never logged. */
-export async function runOnContext(env: Env, ctx: Pick<FrozenContext, "question" | "lang" | "cards" | "context"> & { shown?: string[] }, model: string, opts: { reasoning?: ReasoningLevel; maxTokens?: number; strict?: boolean } = {}): Promise<ModelRun> {
+export async function runOnContext(env: Env, ctx: Pick<FrozenContext, "question" | "lang" | "cards" | "context"> & { shown?: string[] }, model: string, opts: { reasoning?: ReasoningLevel; maxTokens?: number; strict?: boolean; task?: "answer" | "compose"; words?: number } = {}): Promise<ModelRun> {
   const reasoning = opts.reasoning ?? "medium";
+  const task = opts.task ?? "answer";
   const t0 = Date.now();
   try {
     const reply = await reasoningModel(env, model).generate({
       question: ctx.question,
       evidence: ctx.cards as unknown as Array<{ evidence_id: string; type: string }>,
       reasoning,
-      maxTokens: Math.min(8000, Math.max(64, opts.maxTokens ?? 2000)),
+      maxTokens: Math.min(8000, Math.max(64, opts.maxTokens ?? (task === "compose" ? 3000 : 2000))),
       lang: ctx.lang,
       context: ctx.context,
-      task: "answer",
+      task,
+      ...(task === "compose" ? { words: opts.words ?? 250 } : {}),
     });
     const accounts = new Set(ctx.cards.filter((c) => c.type === "artwork" || c.type === "post").map((c) => (c as { author: string }).author));
     const cv = verifyClaims(reply, ctx.cards, { strict: !!opts.strict, authors: accounts });
+    const body = task === "compose" && reply.body ? verifyMarkdown(reply.body, ctx.cards, { strict: !!opts.strict, authors: accounts }) : null;
+    const trail = task === "compose" && reply.thinking?.length ? verifyList(reply.thinking, ctx.cards, { strict: !!opts.strict, authors: accounts }) : null;
     const shown = ctx.cards.filter((c) => c.type === "result" && (ctx.shown?.length ? ctx.shown.includes(c.evidence_id) : true));
     const stated = ctx.shown?.length ? shown : shown.slice(-1);
     const agreement = stated.length ? agreesWithResult(reply.answer, stated as any, ctx.cards, { authors: accounts }) : null;
@@ -104,6 +113,13 @@ export async function runOnContext(env: Env, ctx: Pick<FrozenContext, "question"
       finish_reason: reply.finishReason,
       prompt_version: reply.promptVersion,
       notes: reply.notes,
+      ...(task === "compose"
+        ? {
+            task,
+            body: body ? { words: countWords(body.text), sentences: body.claims.length, removed: body.removed, egs: body.egs, citation_accuracy: body.citation_accuracy } : null,
+            thinking: trail ? { kept: trail.kept.length, removed: trail.removed } : null,
+          }
+        : {}),
     };
   } catch (e) {
     return {

@@ -39,8 +39,13 @@
     "EMBED_VIEWS": "xbrz",
     // SigLIP text vectors of artworks (title, AI caption, tags) and blog posts → VEC_TEXT.
     "TEXT_VECTORS": "on",
-    // gemma (Gemma 4): Moondream's replies came back empty in production (October 2026).
+    // gemma (Gemma 4): Moondream's replies came back empty in production (October 2026). v4.8.1
+    // adds the "chat" backend, which describes with any vision chat model the model table knows
+    // (VLM_MODEL, e.g. @cf/zai-org/glm-5.3-flash); Gemma 4 stays until a comparison on the
+    // corpus says otherwise (scripts/admin.sh describe <id> chat shows what the other one
+    // returns). A change describes new and edited images only; reindex-all describe redoes all.
     "VLM_BACKEND": "gemma",
+    "VLM_MODEL": "@cf/zai-org/glm-5.3-flash",
     "VLM_TARGET": "512",
     // Stages skipped for artworks whose PIXA license says ai-training=false, comma-separated
     // among describe, embed, text. Empty = none (v2 behaviour). The flag is also stored in the
@@ -70,16 +75,32 @@
     "DOCS_BRANCH": "main",
     "DOCS_PATHS": "",
     // Vectors of the documentation (multilingual: a French question finds an English page).
-    // VEC_DOCS is created with DOCS_EMBED_DIM dimensions, which must be the model's (bge-m3: 1024).
-    "DOCS_EMBED_MODEL": "@cf/baai/bge-m3",
+    // VEC_DOCS is created with DOCS_EMBED_DIM dimensions, which must be the model's. v4.8.1:
+    // Qwen3-Embedding-0.6B (1024 dimensions like bge-m3, so the index is kept; questions are
+    // embedded with the retrieval instruction, docs/vectors.ts). After deploying the change run
+    // scripts/admin.sh docs-reembed: until every chunk has its new vector, the vector leg mixes
+    // the two models and help relies on its lexical leg.
+    "DOCS_EMBED_MODEL": "@cf/qwen/qwen3-embedding-0.6b",
     "DOCS_EMBED_DIM": "1024",
-    // Cosine above which a page counts as relevant (bge-m3).
-    "DOCS_MIN_SCORE": "0.5",
+    // Cosine above which a page counts as relevant. 0.5 was read on bge-m3; Qwen3-Embedding's
+    // cosines sit lower (instruction-prefixed queries), so re-read it on a sample of help
+    // questions after the re-embedding (README-V4 "Models, October 2026": scripts/admin.sh
+    // help-ask shows each excerpt's score) and set it here. Start lower rather than higher:
+    // a chunk under the line is only ranked by its words.
+    "DOCS_MIN_SCORE": "0.4",
     // /help (help/answer.ts) writes from the documentation only, citing it; every sentence is
-    // then checked against the excerpts. Nemotron 3 Super, as v3 (chosen over Llama 3.3 70B there).
-    "SEARCH_HELP_MODEL": "@cf/nvidia/nemotron-3-120b-a12b",
-    // auto: fast (5 excerpts, no reasoning) for questions of up to twelve words, else balanced.
+    // then checked against the excerpts. v4.8.1: GLM-5.3-Flash (v4: Nemotron 3 Super): the
+    // stronger writer at a third of the price; it always reasons a little (reasoning_effort
+    // low at the least), which the fast mode's budget allows for.
+    "SEARCH_HELP_MODEL": "@cf/zai-org/glm-5.3-flash",
+    // auto: fast (5 excerpts, no reasoning) for questions of up to twelve words, else balanced
+    // (rich style: never below balanced).
     "HELP_MODE": "auto",
+    // v4.8 (README "Rich answers"): rich — /help writes a complete answer (a direct sentence, the
+    // details, steps as a list, HELP_ANSWER_WORDS words by mode), proposes follow-up questions the
+    // documentation answers, lists the related sections; brief — v4's five sentences.
+    "HELP_STYLE": "rich",
+    "HELP_ANSWER_WORDS": "fast:120,balanced:200,deep:350,expert:600",
     // The cross-encoder on the documentation's excerpts (balanced and deeper, English): not
     // evaluated on the documentation yet, so off.
     "HELP_RERANK": "off",
@@ -88,27 +109,61 @@
     "SUGGEST_POPULAR": "off",
 
     // ---- v4 (spec §57-58): models, reasoning, retrieval, reranking, verification, tracing ------------
-    // Every model is configuration (src/llm/router.ts); the recommended initial configuration of
-    // the spec (§58), to be confirmed by the benchmark on Pixagram's own questions (§31):
-    // scripts/benchmark.py.
+    // Every model is configuration (src/llm/router.ts); the configuration below is v4.8.1's
+    // (README-V4 "Models, October 2026"), to be confirmed by the benchmark on Pixagram's own
+    // questions (§31): scripts/benchmark.py.
+    // The planner stays Gemma 4: it plans with reasoning off, which GLM cannot, and the
+    // templates of the rich answers were checked through it.
     "SEARCH_PLANNER_MODEL": "@cf/google/gemma-4-26b-a4b-it",
-    "SEARCH_REASONING_MODEL": "@cf/openai/gpt-oss-120b",
-    // Per complexity band (SIMPLE, NORMAL, COMPLEX, DEEP): e.g. SEARCH_REASONING_MODEL_SIMPLE.
+    // Reasoning over the evidence: GLM-5.3-Flash (v4: gpt-oss-120b), stronger at a lower price;
+    // it always reasons (reasoning_effort low | high | max; the engine's "none" runs as low).
+    "SEARCH_REASONING_MODEL": "@cf/zai-org/glm-5.3-flash",
+    // Per complexity band (SIMPLE, NORMAL, COMPLEX, DEEP): the deep band (complexity ≥ 0.85, the
+    // multi-hop and comparative questions) goes to GLM-5.3, the full model (10× the price per
+    // token, and slower: a deep answer may take a minute, which defer=1 hides from the UI).
+    // Unset SEARCH_REASONING_MODEL_DEEP (or set it to the Flash model) to run every band on Flash.
+    "SEARCH_REASONING_MODEL_DEEP": "@cf/zai-org/glm-5.3",
     "SEARCH_RERANKER_MODEL": "@cf/baai/bge-reranker-base",
     // Models a public /ask may ask for by name (comma-separated); others need the admin token.
     "SEARCH_PUBLIC_MODELS": "",
-    "SEARCH_LLM_TIMEOUT_MS": "45000",
+    // Long-form replies (a 450-word body with its reasoning trail and claims: ~1,500 tokens, plus
+    // the model's own reasoning) take longer than v4's three sentences did; GLM-5.3 at high
+    // effort longer still.
+    "SEARCH_LLM_TIMEOUT_MS": "120000",
     // auto: by mode (fast none, balanced low, deep medium, expert high); or a level for every mode
     // that reasons. The visible answer is bounded apart from the reasoning (spec §21).
     "SEARCH_REASONING": "auto",
-    "SEARCH_MAX_OUTPUT_TOKENS": "8000",
-    // Reasoning tokens allowed per level, on top of the visible answer.
-    "SEARCH_REASONING_TOKENS": "low:4000,medium:8000,high:16000",
+    // The visible reply, capped here: v4's budgets for brief answers (balanced 2000, deep 4000,
+    // expert 6000), the long-form ones for rich answers (3000, 5000, 8000).
+    "SEARCH_MAX_OUTPUT_TOKENS": "9000",
+    // Reasoning tokens allowed per level, on top of the visible answer. Raised in v4.8.1: GLM
+    // reasons in every mode (low in balanced, high in deep, max in expert), and a reply whose
+    // reasoning exhausts the budget comes back without its answer (finish_reason "length" in
+    // the trace; the deterministic answer still shows).
+    "SEARCH_REASONING_TOKENS": "low:2048,medium:6144,high:16384",
     // Modes: auto follows the complexity band. Public callers up to deep; the search box (/query)
-    // chooses up to balanced by itself.
+    // chooses up to deep by itself (v4: balanced; rich answers want the deeper modes for the
+    // complex questions).
     "SEARCH_DEFAULT_MODE": "auto",
     "SEARCH_MAX_MODE": "deep",
-    "SEARCH_QUERY_MAX_MODE": "balanced",
+    "SEARCH_QUERY_MAX_MODE": "deep",
+
+    // ---- v4.8: long-form answers (README "Rich answers"; src/search/compose.ts, digest.ts) ---------
+    // rich: every answer carries the deterministic digest (facts, overview, caveats, follow-up
+    // questions, related searches) and, in balanced and above, the model's body, reasoning trail,
+    // caveats and follow-ups, verified sentence by sentence. brief: v4's one-line answers (a
+    // request may ask for either: style=rich|brief).
+    "SEARCH_ANSWER_STYLE": "rich",
+    // The body's target length per mode, in words (length=short halves it, long nearly doubles it).
+    "SEARCH_ANSWER_WORDS": "balanced:250,deep:450,expert:800",
+    // Rich answers never run below this mode by themselves (fast has no model): balanced gives
+    // every question from the search box the model, at low reasoning (~$0.002 an uncached answer).
+    "SEARCH_RICH_MIN_MODE": "balanced",
+    // Follow-up questions shown with an answer (the model's that pass, then the templates').
+    "SEARCH_FOLLOW_UPS": "6",
+    // defer=1: how long a frozen context waits for GET /ask/elaboration/:query_id, and how long
+    // its result is kept.
+    "SEARCH_ELABORATION_TTL": "1800",
     "SEARCH_AUTO_COMPLEXITY": "true",
     "SEARCH_COMPLEXITY_BANDS": "0.2,0.4,0.65,0.85",
     // Candidate pools of /ask's retrieval legs in balanced, deep and expert (retrieval.ts depthFor).

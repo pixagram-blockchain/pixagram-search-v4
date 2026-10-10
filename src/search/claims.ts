@@ -778,9 +778,16 @@ export interface VerifyOptions {
    * The numbers inside it are still checked.
    */
   softTitles?: boolean;
+  /**
+   * Long-form answers (compose.ts): a sentence without a factual atom that cites a card it was
+   * given rests on that card and is supported by it, whatever its words (a French sentence over
+   * English captions shares few words with them); one that cites nothing is judged by its words
+   * as usual.
+   */
+  citedInterpretations?: boolean;
 }
 
-type CheckContext = { byId: Map<string, Facts>; all: Facts; results: ResultView[]; owners: Map<string, { author?: string; title?: string }>; authors?: Set<string>; wordOverlap: boolean; softTitles: boolean };
+type CheckContext = { byId: Map<string, Facts>; all: Facts; results: ResultView[]; owners: Map<string, { author?: string; title?: string }>; authors?: Set<string>; wordOverlap: boolean; softTitles: boolean; citedInterpretations: boolean };
 
 function check(text: string, cited: string[], kind: Claim["kind"], ctx: CheckContext): { status: ClaimStatus; supported_by: string[]; problems: string[]; cited_correctly: boolean } {
   const atoms = extractAtoms(text, { authors: ctx.authors });
@@ -816,6 +823,13 @@ function check(text: string, cited: string[], kind: Claim["kind"], ctx: CheckCon
   if (factual.length) return { status: "supported", supported_by: [...supportedBy], problems, cited_correctly: citedOk && cited.length > 0 };
   // no factual atom: an interpretation
   const known = cited.filter((id) => ctx.byId.has(id));
+  if (ctx.citedInterpretations && known.length) {
+    // it rests on the card it cites: supported when at least a quarter of its words are the card's
+    // (a French sentence over English captions still shares its concepts), qualified otherwise
+    const share = overlap(text, citedFacts);
+    if (share >= 0.25) return { status: "supported", supported_by: known, problems, cited_correctly: true };
+    return { status: "qualified", supported_by: known, problems: [`only ${Math.round(share * 100)} % of its words are in the evidence it cites`], cited_correctly: true };
+  }
   if (!ctx.wordOverlap) {
     // documentation: it rests on the excerpt it cites
     if (known.length) return { status: "supported", supported_by: known, problems, cited_correctly: true };
@@ -834,7 +848,7 @@ export function verifyClaims(reply: Pick<ReasoningResponse, "answer" | "claims" 
   const results = resultViews(cards);
   const owners = new Map<string, { author?: string; title?: string }>();
   for (const c of cards) if (c.type === "artwork" || c.type === "post") owners.set(c.evidence_id, { author: c.author, title: c.title });
-  const ctx: CheckContext = { byId, all, results, owners, authors: opts.authors, wordOverlap: opts.wordOverlap !== false, softTitles: !!opts.softTitles };
+  const ctx: CheckContext = { byId, all, results, owners, authors: opts.authors, wordOverlap: opts.wordOverlap !== false, softTitles: !!opts.softTitles, citedInterpretations: !!opts.citedInterpretations };
   const strictly = (s: ClaimStatus): ClaimStatus => (opts.strict && s === "qualified" ? "unsupported" : s);
   const claims: VerifiedClaim[] = reply.claims.map((c) => {
     const r = check(c.text, c.evidence, c.kind, ctx);
@@ -861,6 +875,38 @@ export function verifyClaims(reply: Pick<ReasoningResponse, "answer" | "claims" 
 /** The claims that may appear in an answer: supported ones, and qualified ones outside the strict mode. */
 export function keptClaims(v: ClaimVerification, strict = false): VerifiedClaim[] {
   return v.claims.filter((c) => c.status === "supported" || (!strict && c.status === "qualified"));
+}
+
+/**
+ * The names a text uses that the cards do not contain: accounts, quoted titles and post paths. A
+ * follow-up question about @nobody, or about a title no card bears, names nothing the reader can
+ * ask about (compose.ts drops it).
+ */
+export function unknownNames(text: string, cards: EvidenceCard[], opts: { authors?: Set<string>; numbers?: boolean } = {}): string[] {
+  const all = merge(cards.map(cardFacts));
+  const kinds: AtomKind[] = opts.numbers ? ["account", "title", "ref", "number", "date", "month", "year"] : ["account", "title", "ref"];
+  return extractAtoms(text, opts)
+    .filter((a) => kinds.includes(a.kind))
+    .filter((a) => !hasAtom(all, a) && !(a.kind === "account" && opts.authors?.has(a.value)))
+    .map(describe);
+}
+
+/**
+ * Words that accuse: theft, fraud, plagiarism, bans, crime, in the five languages. A sentence of a
+ * model that names an account and uses one of them, when no card uses it, states an accusation
+ * the evidence does not (compose.ts removes it). "Copy" and "repost" are not here: the index
+ * itself says when an image was posted again.
+ */
+export const ACCUSATION =
+  /\b(scam(?:mer|s|med)?|thie(?:f|ves)|st(?:eal|ole|olen)s?|fraud(?:ster|ulent)?|plagiari[sz](?:ed|m|st)?|bann?ed|illegal|criminal|counterfeit|cheat(?:er|ed|s)?|abus(?:e|er|ive)|harass(?:ed|ment)?|voleur|volé|vole|arnaque|arnaqueur|escroc|plagiat|plagié|banni|illégal|criminel|tricheur|betrug|betrüger|dieb|gestohlen|plagiat|gesperrt|verboten|kriminell|betrüg\w*|estafa|estafador|ladr[oó]n|rob[oó]|robado|plagio|baneado|ilegal|delincuente|tramposo|truffa|truffatore|ladro|rubato|plagio|bannato|illegale|criminale|imbroglione)\b/iu;
+
+/** The accusing words of a text that no card uses (folded). */
+export function accusations(text: string, cards: EvidenceCard[]): string[] {
+  const words = new Set<string>();
+  for (const c of cards) for (const w of cardFacts(c).words) words.add(w);
+  const out: string[] = [];
+  for (const m of foldx(text).matchAll(new RegExp(ACCUSATION.source, "giu"))) if (!words.has(m[1].toLowerCase())) out.push(m[1]);
+  return [...new Set(out)];
 }
 
 // ---- agreement with the deterministic answer ----------------------------------------------------------------

@@ -41,10 +41,11 @@ case "${1:-help}" in
   weights)          curl "${H[@]}" "$BASE/admin/ranker/weights" ;;
   weights-set)      curl "${H[@]}" -X POST "$BASE/admin/ranker/weights" --data-binary "@${2:?weights.json}" ;;
   ltr-export)       curl "${H[@]}" "$BASE/admin/ltr/export?days=${2:-30}" ;;
-  describe)         curl "${H[@]}" -X POST "$BASE/admin/debug/describe/${2:?post id}${3:+?backend=$3}" ;;      # describe id [moondream|caption|scout|gemma]
+  describe)         curl "${H[@]}" -X POST "$BASE/admin/debug/describe/${2:?post id}${3:+?backend=$3}" ;;      # describe id [chat|gemma|scout|moondream|caption]
   docs)             curl "${H[@]}" "$BASE/admin/docs" ;;
   docs-sync)        curl "${H[@]}" -X POST "$BASE/admin/docs/sync$( [ "$(bool_json "${2:-}")" = true ] && echo '?force=1')" ;;  # docs-sync [force]
   docs-reembed)     curl "${H[@]}" -X POST "$BASE/admin/docs/reembed" ;;
+  docs-retrieve)    curl "${H[@]}" -G "$BASE/admin/debug/docs" --data-urlencode "q=${2:?question}" --data-urlencode "k=${3:-10}" ;;  # what retrieval finds (lexical, cosine, score): DOCS_MIN_SCORE calibration
   docs-gaps)        curl "${H[@]}" "$BASE/admin/docs/gaps?days=${2:-30}" ;;
   paph)             curl "${H[@]}" "$BASE/admin/paph" ;;                                         # copy detection: shards, verdicts, identity, budgets
   paph-alerts)      curl "${H[@]}" "$BASE/admin/paph/alerts?days=${2:-30}" ;;                  # cross-author copies, earlier → later
@@ -76,6 +77,7 @@ usage: scripts/admin.sh <command> [args]
   sweep [max] | background | vocab-rebuild | failed | queries [days]
   weights | weights-set <file.json> | ltr-export [days] | describe <id> [backend]
   docs | docs-sync [force] | docs-reembed | docs-gaps [days]       the documentation behind /help
+  docs-retrieve "<question>" [k]                                    its retrieval alone (cosines, for DOCS_MIN_SCORE)
   ask "<question>" [mode] | ask-log [days] [status] | ask-trace <query id>   v4 answers, with traces
   models | ltr-pairs [days] | export-sft [days]                    models; learning-to-rank and fine-tuning data
   query "<text>" | help-ask "<question>" [model]                     public routes, for a quick look;

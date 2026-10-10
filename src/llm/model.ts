@@ -9,9 +9,11 @@
 //                                                 "local:qwen2.5-3b-instruct")
 //
 // Workers AI request styles (checked against the models' input schemas, October 2026):
-//   openai-chat  Nemotron 3, Gemma 4, Kimi K2.6: OpenAI chat completions; json_schema = {name, schema};
-//                reasoning through chat_template_kwargs (Nemotron also has a low-effort mode) or,
-//                for Kimi, reasoning_effort ("none" | "high"); replies as choices[0].message
+//   openai-chat  Nemotron 3, Gemma 4, Kimi K2.6, GLM-5.3 (and -Flash), Qwen3.8, DeepSeek V4: OpenAI
+//                chat completions; json_schema = {name, schema}; reasoning through
+//                chat_template_kwargs (Nemotron also has a low-effort mode), reasoning_effort
+//                ("none" | "high" for Kimi; each model's own levels for GLM, Qwen3.8 and DeepSeek,
+//                see `effort`); replies as choices[0].message
 //   legacy-chat  Llama 3.3, Llama 4 Scout, Qwen 3, Mistral: messages; json_schema = the schema itself;
 //                replies as {response, usage}
 //   gpt-oss      gpt-oss-120b / -20b: messages like legacy-chat; always reasons; the effort is set
@@ -30,8 +32,17 @@ export type ReasoningControl =
   | "chat_template" //      chat_template_kwargs.enable_thinking on/off
   | "chat_template_low" //  …plus low_effort for the "low" level (Nemotron 3)
   | "kimi_effort" //        reasoning_effort "none" | "high" (other levels map to "high")
+  | "effort" //             reasoning_effort in the model's own levels (`effort.map`); "none" through `effort.disable`
   | "system_prompt" //      "Reasoning: low|medium|high" in the system message (gpt-oss: always on)
   | "reasoning_effort"; //  OpenAI-style reasoning_effort "low" | "medium" | "high" (HTTP endpoints)
+
+/** The `effort` control: the engine's levels in the model's words, and how "none" is asked for. */
+export interface EffortControl {
+  /** the model's value for each level ("none" is used only when it can be asked for as an effort) */
+  map: Record<ReasoningLevel, string>;
+  /** how reasoning is turned off: an effort value of its own, the chat template, or not at all (none runs as low) */
+  disable: "effort" | "chat_template" | "never";
+}
 
 export interface ModelSpec {
   /** the id as configured */
@@ -43,7 +54,9 @@ export interface ModelSpec {
   name: string;
   style: RequestStyle;
   reasoning: ReasoningControl;
-  /** whether "none" really turns reasoning off (gpt-oss cannot: none becomes low) */
+  /** the levels of a model controlled by `reasoning_effort` in its own words (reasoning: "effort") */
+  effort?: EffortControl;
+  /** whether "none" really turns reasoning off (gpt-oss and GLM cannot: none becomes low) */
   canDisableReasoning: boolean;
   contextTokens: number;
   /** US dollars per million tokens */
@@ -59,6 +72,13 @@ const OPENAI_CHAT = (o: Partial<Known>): Known => ({ style: "openai-chat", reaso
 const LEGACY = (o: Partial<Known>): Known => ({ style: "legacy-chat", reasoning: "none", canDisableReasoning: true, contextTokens: 32_000, vision: false, ...o });
 const GPT_OSS = (o: Partial<Known>): Known => ({ style: "gpt-oss", reasoning: "system_prompt", canDisableReasoning: false, contextTokens: 128_000, vision: false, ...o });
 
+/** GLM-5.3: reasoning_effort low | high | max, never off (the engine's "none" runs as "low"). */
+const GLM_EFFORT: EffortControl = { map: { none: "low", low: "low", medium: "high", high: "max" }, disable: "never" };
+/** DeepSeek V4: reasoning_effort none | low | high | max. */
+const DEEPSEEK_EFFORT: EffortControl = { map: { none: "none", low: "low", medium: "high", high: "max" }, disable: "effort" };
+/** Qwen3.8: reasoning_effort low | medium | xhigh; off through chat_template_kwargs.enable_thinking. */
+const QWEN38_EFFORT: EffortControl = { map: { none: "low", low: "low", medium: "medium", high: "xhigh" }, disable: "chat_template" };
+
 /** Workers AI models with their facts as published in October 2026 (prices: Workers AI model pages). */
 export const KNOWN_MODELS: Record<string, Known> = {
   "@cf/openai/gpt-oss-120b": GPT_OSS({ price: { input: 0.35, output: 0.75 } }),
@@ -66,6 +86,12 @@ export const KNOWN_MODELS: Record<string, Known> = {
   "@cf/nvidia/nemotron-3-120b-a12b": OPENAI_CHAT({ reasoning: "chat_template_low", contextTokens: 256_000, price: { input: 0.5, output: 1.5 } }),
   "@cf/google/gemma-4-26b-a4b-it": OPENAI_CHAT({ contextTokens: 256_000, vision: true, price: { input: 0.1, output: 0.3 } }),
   "@cf/moonshotai/kimi-k2.6": OPENAI_CHAT({ reasoning: "kimi_effort", contextTokens: 262_144, vision: true, price: { input: 0.95, output: 4.0, cachedInput: 0.16 } }),
+  // v4.8.1: the models the deployed configuration moved to (README-V4 "Models, October 2026")
+  "@cf/zai-org/glm-5.3": OPENAI_CHAT({ reasoning: "effort", effort: GLM_EFFORT, canDisableReasoning: false, contextTokens: 1_048_576, price: { input: 1.4, output: 4.4, cachedInput: 0.26 } }),
+  "@cf/zai-org/glm-5.3-flash": OPENAI_CHAT({ reasoning: "effort", effort: GLM_EFFORT, canDisableReasoning: false, contextTokens: 1_048_576, vision: true, price: { input: 0.15, output: 0.5, cachedInput: 0.03 } }),
+  "@cf/qwen/qwen3.8-27b": OPENAI_CHAT({ reasoning: "effort", effort: QWEN38_EFFORT, contextTokens: 262_144, vision: true, price: { input: 0.45, output: 3.2, cachedInput: 0.05 } }),
+  "@cf/deepseek-ai/deepseek-v4-flash-0731": OPENAI_CHAT({ reasoning: "effort", effort: DEEPSEEK_EFFORT, contextTokens: 1_048_576, price: { input: 0.44, output: 1.32, cachedInput: 0.014 } }),
+  "@cf/deepseek-ai/deepseek-v4-pro-0813": OPENAI_CHAT({ reasoning: "effort", effort: DEEPSEEK_EFFORT, contextTokens: 1_048_576, price: { input: 1.32, output: 3.96, cachedInput: 0.044 } }),
   "@cf/meta/llama-3.3-70b-instruct-fp8-fast": LEGACY({ contextTokens: 24_000, price: { input: 0.293, output: 2.253 } }),
   "@cf/meta/llama-4-scout-17b-16e-instruct": LEGACY({ contextTokens: 131_000, vision: true, price: { input: 0.27, output: 0.85 } }),
   "@cf/meta/llama-3.1-8b-instruct-fp8": LEGACY({ contextTokens: 32_000, price: { input: 0.152, output: 0.287 } }),
@@ -77,6 +103,7 @@ export const KNOWN_MODELS: Record<string, Known> = {
 export const KNOWN_PRICES: Record<string, { input: number; output?: number }> = {
   "@cf/baai/bge-reranker-base": { input: 0.00311 },
   "@cf/baai/bge-m3": { input: 0.0118 },
+  "@cf/qwen/qwen3-embedding-0.6b": { input: 0.0118 },
 };
 
 export interface EndpointConfig {
@@ -170,7 +197,7 @@ export function reasoningAllowance(env: Env | undefined, level: ReasoningLevel):
 /** The level a model actually runs at: one it cannot honour is mapped to the nearest it can. */
 export function effectiveReasoning(spec: ModelSpec, level: ReasoningLevel): ReasoningLevel {
   if (spec.reasoning === "none") return "none";
-  if (level === "none" && !spec.canDisableReasoning) return "low";
+  if (level === "none" && (!spec.canDisableReasoning || (spec.reasoning === "effort" && spec.effort?.disable === "never"))) return "low";
   if (spec.reasoning === "kimi_effort" && level !== "none") return "high";
   if (spec.reasoning === "chat_template" && level !== "none") return "medium"; // on/off only: one "on" level
   return level;

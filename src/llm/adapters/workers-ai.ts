@@ -3,7 +3,8 @@
 //
 //   style        request                                                   reply
 //   openai-chat  messages, response_format.json_schema = {name, schema},   choices[0].message.content
-//                chat_template_kwargs / reasoning_effort for reasoning
+//                chat_template_kwargs / reasoning_effort for reasoning (GLM-5.3, Qwen3.8 and
+//                DeepSeek V4 take reasoning_effort in their own levels: model.ts `effort`)
 //   legacy-chat  messages, response_format.json_schema = the schema         {response, usage}
 //   gpt-oss      as legacy-chat, plus "Reasoning: <level>" in the system    either of the above, or the
 //                message (it always reasons; "none" runs as "low")         Responses API's output[]
@@ -28,7 +29,7 @@ export function jsonSchemaFormat(spec: Pick<ModelSpec, "style">, name: string, s
  * Request fields that set a model's reasoning. Sent only to the models that take them: the others'
  * input schemas do not have these fields.
  */
-export function reasoningFields(spec: Pick<ModelSpec, "reasoning">, level: ReasoningLevel): Record<string, unknown> {
+export function reasoningFields(spec: Pick<ModelSpec, "reasoning" | "effort">, level: ReasoningLevel): Record<string, unknown> {
   switch (spec.reasoning) {
     case "chat_template":
       return { chat_template_kwargs: { enable_thinking: level !== "none" } };
@@ -37,6 +38,14 @@ export function reasoningFields(spec: Pick<ModelSpec, "reasoning">, level: Reaso
       return { chat_template_kwargs: level === "low" ? { enable_thinking: true, low_effort: true } : { enable_thinking: true } };
     case "kimi_effort":
       return { reasoning_effort: level === "none" ? "none" : "high" };
+    case "effort": {
+      const e = spec.effort;
+      if (!e) return {};
+      // off: the model's own "none" effort, or the chat template; a model that never stops
+      // reasoning gets its lowest level (effectiveReasoning already mapped "none" to "low")
+      if (level === "none") return e.disable === "chat_template" ? { chat_template_kwargs: { enable_thinking: false } } : { reasoning_effort: e.map.none };
+      return { reasoning_effort: e.map[level] };
+    }
     default:
       return {};
   }

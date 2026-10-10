@@ -8,11 +8,13 @@ import { isReasoningLevel } from "../llm/provider";
 import { syncDocs } from "../docs/sync";
 import { repoName, repoRef, verifyWebhook } from "../docs/github";
 import { bodyObject, isAdmin, readBody, type Bindings } from "./common";
+import { richOptions } from "./ask";
 
 export function registerHelp(app: Hono<Bindings>): void {
   /**
    * GET ?q= or POST {"question"}. v4: mode=fast|balanced|deep|expert (default HELP_MODE: by the
-   * question's length) and reasoning=none|low|medium (high needs the admin token).
+   * question's length) and reasoning=none|low|medium (high needs the admin token). v4.8:
+   * style=rich|brief and length=short|medium|long (README "Rich answers").
    */
   app.on(["GET", "POST"], "/help", async (c) => {
     const body = await bodyObject(c);
@@ -24,7 +26,9 @@ export function registerHelp(app: Hono<Bindings>): void {
     const r = isReasoningLevel(reasoning) && (reasoning !== "high" || isAdmin(c)) ? reasoning : undefined;
     // expert is the admin's, as for /ask
     const m = isHelpMode(mode) && (mode !== "expert" || isAdmin(c)) ? mode : undefined;
-    return c.json(await answerHelp(c.env, question, { mode: m, reasoning: r }));
+    // v4.8: style=rich|brief (default HELP_STYLE), length=short|medium|long
+    const { style, length } = richOptions((k) => body[k] ?? sp.get(k));
+    return c.json(await answerHelp(c.env, question, { mode: m, reasoning: r, style, length }));
   });
 
   /**

@@ -9,9 +9,20 @@
 //            ─► reasoning model, when the mode allows and it is worth its cost           llm/reasoning.ts
 //            ─► claim verification: unsupported claims removed, contradictions rejected   claims.ts
 //            ─► confidence from the evidence, versions, timings, trace                  confidence.ts
+//            ─► v4.8: the long-form answer — the deterministic digest (digest.ts), the model's
+//               body, reasoning trail, caveats and follow-ups verified sentence by sentence,
+//               assembled as Markdown and plain text (compose.ts)
 //
 // The index decides what happened; the model only explains it (spec §61). mode=v3 is v3's /ask,
-// unchanged (ask-v3.ts). Every v3 response field keeps its meaning; v4's are added beside them.
+// unchanged (ask-v3.ts). Every v3 response field keeps its meaning; v4's are added beside them,
+// and v4.8's beside those: answer_text still carries the direct answer (unless text=full is
+// asked), answer_full and answer_markdown the whole.
+//
+// Rich answers (SEARCH_ANSWER_STYLE=rich, the default) call the model for every answered question
+// in balanced and above, and auto never runs below SEARCH_RICH_MIN_MODE. With defer=1 the answer
+// comes back at once with the digest, and the model's part is fetched afterwards from
+// GET /ask/elaboration/:query_id (the frozen context waits in KV): the search box shows the
+// index's answer in milliseconds and fills in the rest when the model is done.
 
 import type { Env } from "../env";
 import { bool, int, list, num, now } from "../env";
@@ -19,7 +30,7 @@ import type { Lang } from "../lib/text";
 import { fold, guessLang, randomId } from "../lib/text";
 import { isReasoningLevel, LlmError, type ReasoningLevel } from "../llm/provider";
 import { generateCached, reasoningModel, UnusableReply, type ReasoningResponse } from "../llm/reasoning";
-import { isModelId, modelSpec } from "../llm/model";
+import { isModelId } from "../llm/model";
 import { modelFor } from "../llm/router";
 import { PROMPT_VERSION } from "../llm/prompts";
 import { loadContext, type SearchContext } from "./context";
@@ -28,23 +39,44 @@ import type { QueryPlan } from "./planner";
 import { compactPlan, rowToItem, type SearchItem } from "./service";
 import { askV3, evidenceOf, planQuestion, type AskRequest, type AskResponse, type Evidence } from "./ask-v3";
 import { decompose, decomposeRules, looksMultiStep, subqueries, withoutInstructions, withoutQuoted, type QueryProgram, type Subquery } from "./query-planner";
-import { chooseMode, PROFILES, routeQuestion, type ExecutionProfile, type Mode, type ModeRequest, type QueryClass, type QueryRoute } from "./query-router";
-import { depthFor } from "./retrieval";
+import { chooseMode, COMPOSE_TOKENS, PROFILES, richMinMode, routeQuestion, type ExecutionProfile, type Mode, type ModeRequest, type QueryClass, type QueryRoute } from "./query-router";
+import { depthFor, metadataRows } from "./retrieval";
 import { composeDeterministic, executeProgram, type StepOutcome } from "./executor";
 import { applyVerification, conflictSentence, verifyEvidence } from "./verifier";
 import { artworkCard, buildGraph, modelView, resultCard, rowsByPath, type ArtworkCard, type ConflictCard, type EvidenceCard, type EvidenceGraph } from "./evidence";
 import { agreesWithResult, keptClaims, verifyClaims, type ClaimVerification, type VerifiedClaim } from "./claims";
-import { combineConfidence, confidenceWeights, type Confidence } from "./confidence";
+import { combineConfidence, confidenceWeights } from "./confidence";
 import { rerankBlend, rerankRows, rerankerVersion } from "./reranker";
-import { answerLang, say } from "./answer-text";
-import type { HistoryFacts, Verified } from "./operators";
+import { answerLang, say, type AnswerLang } from "./answer-text";
+import type { HistoryFacts, Row, Verified } from "./operators";
 import { imageOutcome, imageTask, queryImageCard, type ImageFindings, type QueryImage } from "./image-question";
 import type { ImageIdentity, QueryImageCard, ResultCard } from "./evidence";
+import { buildDigest, type Digest, type DigestStats } from "./digest";
+import { answerSuggestionsKey, type AnswerSuggestions } from "./suggest";
+import {
+  assembleMarkdown,
+  countWords,
+  followUpLimit,
+  isAnswerStyle,
+  suggestions,
+  toPlainText,
+  verifyList,
+  verifyMarkdown,
+  wordTarget,
+  type AnswerSections,
+  type AnswerStyle,
+  type LengthRequest,
+  type SuggestionItem,
+  type TextMode,
+  type ThinkingStep,
+} from "./compose";
 
 export { askV3, evidenceOf, type AskRequest, type AskResponse, type Evidence } from "./ask-v3";
 export { lexicalEvidence, verify, zThreshold, isTitleSubject, timeKey, SUBJECT_TEMPLATES } from "./retrieval";
 
 export const RETRIEVAL_VERSION = "4.0.0";
+/** The long-form answer layer (compose.ts, digest.ts): part of every answer's versions. */
+export const ANSWER_VERSION = "4.8.0";
 
 export interface AskRequestV4 extends AskRequest {
   mode?: ModeRequest;
@@ -69,9 +101,21 @@ export interface AskRequestV4 extends AskRequest {
     /** a vision model's description of it, made on demand (the deeper modes, "what is it?") */
     describe?: () => Promise<QueryImage["description"] | null>;
   };
+  // ---- v4.8 ----
+  /** rich (default: SEARCH_ANSWER_STYLE): the long-form answer; brief: v4's */
+  style?: AnswerStyle;
+  /** full: answer_text carries the whole long-form answer; short (default): the direct answer, as v4 */
+  text?: TextMode;
+  /** how long the model's body should be, against the mode's target */
+  length?: LengthRequest;
+  /** rich: answer now with the digest, and leave the model's elaboration to GET /ask/elaboration/:query_id */
+  defer?: boolean;
 }
 
 export type AskStatus = "answered" | "no_match" | "insufficient_evidence" | "conflict" | "clarify" | "not_found";
+
+/** inline: the model's part is in this answer; pending: fetch it from url; ready: this is that part (GET /ask/elaboration); none: there is none */
+export type ElaborationStatus = "inline" | "pending" | "ready" | "none";
 
 export interface AskResponseV4 extends AskResponse {
   status: AskStatus;
@@ -112,6 +156,41 @@ export interface AskResponseV4 extends AskResponse {
     hidden: number;
   };
   trace?: Record<string, unknown>;
+  // ---- v4.8: the long-form answer (README "Rich answers") ----
+  style: AnswerStyle;
+  /** the direct answer: result_text then the explanation (what answer_text is unless text=full) */
+  answer_short: string;
+  /** the whole answer as plain text: the direct answer, the body, the index's facts, the reasoning trail, caveats, follow-ups */
+  answer_full: string;
+  /** the same as Markdown, citations kept ([E12], [R1]) for a UI that links them to cards */
+  answer_markdown: string;
+  sections: AnswerSections;
+  /** the model's reasoning trail, verified step by step (sections.thinking) */
+  thinking: ThinkingStep[];
+  suggestions: { follow_ups: SuggestionItem[]; searches: SuggestionItem[] };
+  digest: { stats: DigestStats; about: string[] };
+  /** words of the body, and the target the model was given */
+  length: { words: number; target: number | null };
+  /** where the model's part of a rich answer is: inline, pending at url (defer=1), or none (fast mode, brief style, nothing to explain) */
+  elaboration: { status: ElaborationStatus; url?: string; reason?: string };
+}
+
+/**
+ * What GET /ask/elaboration/:query_id returns: pending while another call runs the model on this
+ * answer, ready with the fields the model's part changed (merge them over the first answer: its
+ * notes already include the first answer's), failed when the model did not answer (a transient
+ * failure is tried again by the next call, up to ELABORATION_ATTEMPTS; a reply the engine could
+ * not use is final), unknown for an id that expired or never was.
+ */
+export interface ElaborationResponse {
+  query_id: string;
+  status: "pending" | "ready" | "failed" | "unknown";
+  /** the fields of the answer that the elaboration changed (merge them over the first answer) */
+  answer?: Pick<AskResponseV4, "status" | "answer_text" | "answer_short" | "answer_full" | "answer_markdown" | "explanation" | "sections" | "thinking" | "suggestions" | "claims" | "rationale" | "grounding" | "usage" | "model" | "reasoning" | "confidence" | "confidence_parts" | "length" | "elaboration"> & { versions: Record<string, string | null>; timings: Record<string, number>; notes: string[] };
+  error?: string;
+  /** failed: whether the next call will try the model again */
+  retry?: boolean;
+  took_ms: number;
 }
 
 const SUMMARY = /\b(what kind|what type|what sort|describe|summari[sz]e|tell me about|what does @?[a-z0-9.-]+ (draw|post|make|paint|create)|quel genre|quel type|quels types|decri|resume|parle moi|was fur|welche art|beschreib|zusammenfass|que tipo|que clase|describe|resume|che tipo|che genere|descrivi|riassum)\b/;
@@ -142,7 +221,7 @@ function maxModeFor(env: Env, admin: boolean): Mode {
   return ORDER.includes(m) ? m : "deep";
 }
 
-function pickModel(env: Env, a: AskRequestV4, route: QueryRoute, notes: string[]): string {
+function pickModel(env: Env, a: Pick<AskRequestV4, "model" | "admin">, route: Pick<QueryRoute, "band">, notes: string[]): string {
   const wanted = a.model?.trim();
   if (wanted) {
     const allowed = a.admin || list(env.SEARCH_PUBLIC_MODELS).includes(wanted);
@@ -150,6 +229,13 @@ function pickModel(env: Env, a: AskRequestV4, route: QueryRoute, notes: string[]
     notes.push(allowed ? `unknown model ${wanted}: the configured one is used` : `model ${wanted} is not available to this caller: the configured one is used`);
   }
   return modelFor(env, "reasoning", route.band);
+}
+
+/** The answer style of a request: its own, else SEARCH_ANSWER_STYLE, else rich. */
+export function answerStyle(env: Env, requested?: AnswerStyle): AnswerStyle {
+  if (requested) return requested;
+  const s = String(env.SEARCH_ANSWER_STYLE ?? "rich").trim().toLowerCase();
+  return isAnswerStyle(s) ? s : "rich";
 }
 
 const r3 = (x: number) => Math.round(x * 1000) / 1000;
@@ -205,6 +291,353 @@ function selectCards(outcomes: StepOutcome[], profile: ExecutionProfile, rerank:
   return [...picked.values()].slice(0, Math.max(profile.cards, final.result.evidence.length ? 1 : 0));
 }
 
+// ---- the model's reply, applied (shared by the inline and the deferred paths) ---------------------------------
+
+/** Everything the model's reply is judged against, frozen when the answer is deferred. */
+interface LeadInput {
+  l: AnswerLang;
+  resultText: string;
+  /** the index answered, so the model only explains */
+  hasDeterministic: boolean;
+  /** the results the deterministic answer states: an explanation must state their values too */
+  shownCards: ResultCard[];
+  /** the cards that passed verification: what the model saw and what its claims are checked against */
+  usable: EvidenceCard[];
+  /** the accounts of the evidence (names without "@" are read as accounts) */
+  accounts: string[];
+  strictClaims: boolean;
+  verifyClaimsOn: boolean;
+  /** "describe" for "what is this image?", else null */
+  task: string | null;
+  finalStatus: string;
+  /** the status before the model: answered, conflict … */
+  status: AskStatus;
+  /** the conflict sentences to append to a model answer that replaces nothing */
+  conflictText: string;
+  routeClass: QueryClass;
+  hasPremise: boolean;
+  /** rich answers: the direct answer is read by people, its citations stay in the claims and the body */
+  stripCitations: boolean;
+}
+
+const stripCites = (s: string) => s.replace(/\s*\[(?:[A-Za-z]{1,2}\d{1,9}|\d{1,2})\]/g, "").replace(/\s+/g, " ").trim();
+
+interface LeadOutcome {
+  status: AskStatus;
+  answerText: string;
+  explanation?: string;
+  rationale?: string;
+  modelUsed: boolean;
+  cv: ClaimVerification | null;
+  /** the lead contradicted the index's result: nothing else of the reply is trusted */
+  contradicted: boolean;
+  notes: string[];
+}
+
+/** spec §27: when the index answers, its answer is said first and the model only explains it. */
+function applyLead(f: LeadInput, reply: ReasoningResponse, answerText0: string): LeadOutcome {
+  const notes: string[] = [];
+  let status = f.status;
+  let answerText = answerText0;
+  let explanation: string | undefined;
+  let rationale: string | undefined;
+  let modelUsed = false;
+  let contradicted = false;
+  const accounts = new Set(f.accounts);
+  const cv = f.verifyClaimsOn ? verifyClaims(reply, f.usable, { strict: f.strictClaims, authors: accounts }) : null;
+  const agreement = f.hasDeterministic && cv ? agreesWithResult(reply.answer, f.shownCards, f.usable, { authors: accounts }) : { ok: true, problems: [] as string[] };
+  const answerOk = !cv || cv.answer.status === "supported" || (cv.answer.status === "qualified" && !f.strictClaims);
+  const explains = f.hasDeterministic || (f.task === "describe" && f.finalStatus === "no_match");
+  if (reply.status === "insufficient_evidence") {
+    if (explains) notes.push("the model judged the evidence insufficient; the index's own answer stands");
+    else {
+      status = "insufficient_evidence";
+      answerText = say("insufficient", f.l);
+    }
+  } else if (answerOk && agreement.ok && reply.answer.trim()) {
+    modelUsed = true;
+    if (explains) {
+      explanation = f.stripCitations ? stripCites(reply.answer) : reply.answer.trim();
+      answerText = `${f.resultText} ${explanation}`.trim();
+      // "what is this image?" is answered by the description even when no indexed artwork is the same image
+      if (f.task === "describe" && status === "no_match") status = "answered";
+    } else {
+      answerText = f.stripCitations ? stripCites(reply.answer) : reply.answer;
+      if (f.conflictText && !/\d{4}-\d{2}-\d{2}.*\d{4}-\d{2}-\d{2}/.test(answerText)) answerText = `${answerText} ${f.conflictText}`;
+    }
+    // a conflict is the evidence verifier's to find: the model's word alone does not change the status
+    if (reply.status === "conflict" && !f.conflictText) notes.push("the model reported a conflict the evidence verifier did not find");
+  } else {
+    const why = !answerOk ? `${cv!.answer.status} (${cv!.answer.problems.join("; ").slice(0, 200)})` : !agreement.ok ? `it does not state the index's answer (${agreement.problems.join("; ").slice(0, 200)})` : "empty";
+    notes.push(`the model's ${explains ? "explanation" : "answer"} was not used: ${why}`);
+    contradicted = !!cv && cv.answer.status === "contradicted";
+    if (!explains) {
+      const kept = cv ? keptClaims(cv, f.strictClaims).filter((c) => c.kind !== "inference" || c.status === "supported") : [];
+      if (kept.length) {
+        modelUsed = true;
+        answerText = kept.map((c) => c.text).join(" ");
+      } else {
+        status = "insufficient_evidence";
+        answerText = say("insufficient", f.l);
+      }
+    }
+  }
+  // the rationale of a reply that was used, checked as strictly as the answer
+  const rationaleOk = !cv || cv.rationale?.status === "supported" || (!f.strictClaims && cv.rationale?.status === "qualified");
+  if (modelUsed && reply.rationale && rationaleOk) rationale = reply.rationale;
+  // "why …?": the index holds what happened, not why. Without a grounded explanation from the
+  // model, the facts are given as facts and the question is not answered (a premise check is).
+  if (f.routeClass === "EXPLANATORY" && status === "answered" && !explanation && !(modelUsed && !f.hasDeterministic) && !f.hasPremise) {
+    status = "insufficient_evidence";
+    answerText = `${say("insufficient", f.l)} ${f.resultText}`.trim();
+  }
+  return { status, answerText, explanation, rationale, modelUsed, cv, contradicted, notes };
+}
+
+// ---- the long-form answer -------------------------------------------------------------------------------------
+
+interface ComposeInput {
+  env: Env;
+  lang: Lang;
+  question: string;
+  style: AnswerStyle;
+  /** the direct answer (answer_text): the lead */
+  lead: string;
+  digest: Digest;
+  /** the model's reply, when one was used for the lead (or its body alone may be used) */
+  reply: ReasoningResponse | null;
+  /** the lead contradicted the result: the reply's body is not shown */
+  contradicted: boolean;
+  usable: EvidenceCard[];
+  accounts: Set<string>;
+  knownAuthors: Set<string>;
+  strict: boolean;
+  target: number | null;
+  notes: string[];
+}
+
+interface ComposedAnswer {
+  sections: AnswerSections;
+  full: string;
+  markdown: string;
+  words: number;
+  /** the body's sentence checks, for the trace */
+  body: { removed: number; egs: number; citation_accuracy: number; claims: VerifiedClaim[] } | null;
+  removed: { thinking: number; caveats: number; follow_ups: number; searches: number };
+}
+
+/** The sections of the answer: the lead, the model's verified body and trail, the digest, the suggestions. */
+async function composeAnswer(x: ComposeInput): Promise<ComposedAnswer> {
+  const sections: AnswerSections = { lead: x.lead, facts: [], overview: [], thinking: [], caveats: [], follow_ups: [], searches: [] };
+  let body: ComposedAnswer["body"] = null;
+  const removed = { thinking: 0, caveats: 0, follow_ups: 0, searches: 0 };
+  if (x.style === "brief") {
+    return { sections, full: x.lead, markdown: x.lead, words: countWords(x.lead), body, removed };
+  }
+  // a reply whose lead contradicted the result, or that judged the evidence insufficient, has no body to show
+  const reply = x.reply && !x.contradicted && x.reply.status !== "insufficient_evidence" ? x.reply : null;
+  if (x.reply && x.contradicted) x.notes.push("the model's body and reasoning trail were not used: its answer contradicted the index's result");
+  if (reply?.body) {
+    const v = verifyMarkdown(reply.body, x.usable, { strict: x.strict, authors: x.accounts });
+    body = { removed: v.removed, egs: v.egs, citation_accuracy: v.citation_accuracy, claims: v.claims };
+    if (v.removed) x.notes.push(`${v.removed} sentence(s) of the body removed: not supported by the evidence`);
+    // a body that only repeats the lead adds nothing
+    if (v.text && fold(v.text) !== fold(x.lead)) sections.body = v.text;
+  }
+  if (reply?.thinking?.length) {
+    const v = verifyList(reply.thinking, x.usable, { strict: x.strict, authors: x.accounts });
+    removed.thinking = v.removed;
+    if (v.removed) x.notes.push(`${v.removed} step(s) of the reasoning trail removed: not supported by the evidence`);
+    if (v.kept.length >= 2) sections.thinking = v.kept.map((s, i) => ({ n: i + 1, text: s.text, evidence: s.evidence, status: s.status }));
+  }
+  sections.overview = x.digest.overview;
+  sections.facts = x.digest.facts;
+  const caveats = [...x.digest.caveats];
+  if (reply?.caveats?.length) {
+    const v = verifyList(reply.caveats, x.usable, { strict: x.strict, authors: x.accounts });
+    removed.caveats = v.removed;
+    for (const c of v.kept) if (!caveats.some((d) => fold(d) === fold(c.text))) caveats.push(c.text);
+  }
+  sections.caveats = caveats.slice(0, 8);
+  const s = await suggestions({ env: x.env, authors: x.knownAuthors, lang: x.lang, cards: x.usable, question: x.question }, reply ? { followUps: reply.followUps, searches: reply.searches } : null, x.digest, { limit: followUpLimit(x.env), notes: x.notes });
+  sections.follow_ups = s.follow_ups;
+  sections.searches = s.searches;
+  removed.follow_ups = s.removed.follow_ups;
+  removed.searches = s.removed.searches;
+  const markdown = assembleMarkdown({ lang: x.lang, sections });
+  return { sections, full: toPlainText(markdown), markdown, words: countWords(sections.body ?? "") + countWords(x.lead), body, removed };
+}
+
+// ---- deferred elaboration ---------------------------------------------------------------------------------------
+
+/** The frozen context of a deferred answer, kept in KV until GET /ask/elaboration/:qid runs the model. */
+interface FrozenElaboration {
+  v: 1;
+  query_id: string;
+  question: string;
+  lang: Lang;
+  mode: Mode;
+  reasoning: ReasoningLevel;
+  maxOutputTokens: number;
+  strictClaims: boolean;
+  model: string;
+  words: number;
+  modelCards: EvidenceCard[];
+  context: string[];
+  lead: LeadInput;
+  answerText0: string;
+  digest: Digest;
+  /** full: answer_text carries the whole answer (as the first answer did) */
+  text: TextMode;
+  /** the first answer's notes: the elaboration's answer carries them too */
+  notes: string[];
+  /** the parts of the confidence the model does not change, and the operator's confidence the cap follows */
+  confidence: { parts: Record<string, number | null>; planConfidence: number; operator: number | null; operatorConfidence: number; hasDeterministic: boolean };
+  versions: Record<string, string | null>;
+  cacheTtl: number;
+  at: number;
+  /** model calls made so far (the next one is refused past ELABORATION_ATTEMPTS) */
+  attempts: number;
+}
+
+/** Model calls a deferred answer may make before its elaboration is given up (transient failures). */
+export const ELABORATION_ATTEMPTS = 3;
+
+/** The follow-ups and searches of an answer, for GET /suggest?after=<query_id> (search/suggest.ts). */
+function keepSuggestions(env: Env, qid: string, s: { follow_ups: SuggestionItem[]; searches: SuggestionItem[] }): Promise<void> {
+  const body: AnswerSuggestions = { follow_ups: s.follow_ups.map((f) => ({ text: f.text, route: f.route })), searches: s.searches.map((x) => ({ text: x.text, route: "search" })) };
+  return env.CACHE.put(answerSuggestionsKey(qid), JSON.stringify(body), { expirationTtl: elaborationTtl(env) }).catch(() => {});
+}
+
+const elabKey = (qid: string) => `elab:${qid}`;
+const elabDoneKey = (qid: string) => `elab:${qid}:done`;
+const elabRunKey = (qid: string) => `elab:${qid}:run`;
+const elaborationTtl = (env: Env) => Math.max(120, int(env.SEARCH_ELABORATION_TTL, 1800));
+const elaborationUrl = (qid: string) => `/ask/elaboration/${qid}`;
+/** Seconds a running elaboration holds its marker: longer than the model's timeout, so a second call never doubles a call in flight. */
+const RUN_MARKER_TTL = 120;
+
+/**
+ * GET /ask/elaboration/:qid: the model's part of a deferred rich answer. Runs the model on the
+ * frozen context once — a marker holds while it runs, so calls that overlap are told to wait
+ * (pending), and the result, or a final failure, is kept — and returns the fields it changed.
+ * One /ask may thus cost at most ELABORATION_ATTEMPTS model calls, however often it is polled.
+ */
+export async function elaborate(env: Env, qid: string): Promise<ElaborationResponse> {
+  const t0 = Date.now();
+  if (!/^[A-Za-z0-9_-]{6,64}$/.test(qid)) return { query_id: qid, status: "unknown", error: "no such answer", took_ms: 0 };
+  const done = (await env.CACHE.get(elabDoneKey(qid), "json").catch(() => null)) as ElaborationResponse | null;
+  if (done && (done.status === "ready" || done.status === "failed")) return { ...done, took_ms: Date.now() - t0 };
+  const frozen = (await env.CACHE.get(elabKey(qid), "json").catch(() => null)) as FrozenElaboration | null;
+  if (!frozen || frozen.v !== 1) return { query_id: qid, status: "unknown", error: "no deferred answer with this id (it may have expired: answers wait SEARCH_ELABORATION_TTL seconds)", took_ms: Date.now() - t0 };
+  if (await env.CACHE.get(elabRunKey(qid)).catch(() => null)) return { query_id: qid, status: "pending", error: "the model is answering: ask again in a moment", took_ms: Date.now() - t0 };
+  const attempts = (frozen.attempts ?? 0) + 1;
+  const keep = (r: ElaborationResponse) => env.CACHE.put(elabDoneKey(qid), JSON.stringify(r), { expirationTtl: elaborationTtl(env) }).catch(() => {});
+  if (attempts > ELABORATION_ATTEMPTS) {
+    const out: ElaborationResponse = { query_id: qid, status: "failed", error: `the model did not answer in ${ELABORATION_ATTEMPTS} attempts`, retry: false, took_ms: Date.now() - t0 };
+    await keep(out);
+    await env.CACHE.delete(elabKey(qid)).catch(() => {});
+    return out;
+  }
+  // the marker, and the attempt counted, before the model is called
+  await env.CACHE.put(elabRunKey(qid), "1", { expirationTtl: RUN_MARKER_TTL }).catch(() => {});
+  await env.CACHE.put(elabKey(qid), JSON.stringify({ ...frozen, attempts }), { expirationTtl: elaborationTtl(env) }).catch(() => {});
+  const notes: string[] = [...(frozen.notes ?? [])];
+  const timings: Record<string, number> = {};
+  const ctx = await loadContext(env);
+  let reply: (ReasoningResponse & { cached?: boolean }) | null = null;
+  let failure: { message: string; final: boolean } | null = null;
+  let tp = Date.now();
+  try {
+    reply = await generateCached(
+      env,
+      reasoningModel(env, frozen.model),
+      { question: frozen.question, evidence: frozen.modelCards as unknown as Array<{ evidence_id: string; type: string }>, reasoning: frozen.reasoning, maxTokens: frozen.maxOutputTokens, lang: frozen.lang, context: frozen.context, task: "compose", words: frozen.words },
+      frozen.cacheTtl,
+    );
+  } catch (e) {
+    const transient = e instanceof LlmError && e.retryable;
+    failure = { message: `reasoning model unavailable (${frozen.model}): ${e instanceof Error ? e.message : String(e)}${transient ? " (transient)" : e instanceof UnusableReply ? " (unusable reply)" : ""}`, final: !transient };
+  } finally {
+    await env.CACHE.delete(elabRunKey(qid)).catch(() => {});
+  }
+  timings.model = Date.now() - tp;
+  if (reply?.notes?.length) notes.push(...reply.notes);
+  if (!reply) {
+    // a transient failure is tried again by the next call (up to the attempts); a reply the
+    // engine cannot use, or the last attempt, is final: the first answer stands as it was
+    const final = failure!.final || attempts >= ELABORATION_ATTEMPTS;
+    const out: ElaborationResponse = { query_id: qid, status: "failed", error: failure!.message, retry: !final, took_ms: Date.now() - t0 };
+    if (final) {
+      await keep(out);
+      await env.CACHE.delete(elabKey(qid)).catch(() => {});
+    }
+    return out;
+  }
+  tp = Date.now();
+  const lead = applyLead(frozen.lead, reply, frozen.answerText0);
+  notes.push(...lead.notes);
+  timings.claims = Date.now() - tp;
+  tp = Date.now();
+  const accounts = new Set(frozen.lead.accounts);
+  const composed = await composeAnswer({ env, lang: frozen.lang, question: frozen.question, style: "rich", lead: lead.answerText, digest: frozen.digest, reply, contradicted: lead.contradicted, usable: frozen.lead.usable, accounts, knownAuthors: ctx.authors, strict: frozen.strictClaims, target: frozen.words, notes });
+  timings.compose = Date.now() - tp;
+  const cv = lead.cv;
+  const c = frozen.confidence;
+  const conf = combineConfidence(
+    {
+      retrieval: c.parts.retrieval ?? 0,
+      reranking: c.parts.reranking ?? null,
+      agreement: c.parts.agreement ?? 1,
+      verification: c.hasDeterministic ? (lead.modelUsed && cv ? 0.5 + 0.5 * cv.egs : 1) : lead.modelUsed ? (cv ? (cv.answer.status === "supported" ? 0.5 + 0.5 * cv.egs : 0.5 * cv.egs) : 0.6) : 0.3,
+      model: lead.modelUsed ? (reply.confidence ?? null) : null,
+      planConfidence: c.planConfidence,
+    },
+    confidenceWeights(env),
+  );
+  // the caps, as the inline path applies them once the lead settled the status
+  let confidence = conf.value;
+  if (c.hasDeterministic && c.operatorConfidence > 0) confidence = r3(Math.min(confidence, c.operatorConfidence));
+  if (lead.status === "no_match") confidence = r3(Math.min(confidence, c.operatorConfidence || confidence));
+  if (lead.status === "insufficient_evidence" || lead.status === "clarify" || lead.status === "not_found") confidence = r3(Math.min(confidence, 0.3));
+  const usage = reply.usage ? { input_tokens: reply.usage.inputTokens, output_tokens: reply.usage.outputTokens, ...(reply.usage.reasoningTokens !== undefined ? { reasoning_tokens: reply.usage.reasoningTokens } : {}), cost_usd: reply.costUsd, model_ms: reply.latencyMs, ...(reply.cached ? { cached: true } : {}) } : undefined;
+  const answer: NonNullable<ElaborationResponse["answer"]> = {
+    status: lead.status,
+    answer_text: frozen.text === "full" ? composed.full : lead.answerText,
+    answer_short: lead.answerText,
+    answer_full: composed.full,
+    answer_markdown: composed.markdown,
+    ...(lead.explanation ? { explanation: lead.explanation } : {}),
+    sections: composed.sections,
+    thinking: composed.sections.thinking,
+    suggestions: { follow_ups: composed.sections.follow_ups, searches: composed.sections.searches },
+    claims: cv?.claims ?? [],
+    ...(lead.rationale ? { rationale: lead.rationale } : {}),
+    ...(cv ? { grounding: { egs: cv.egs, citation_accuracy: cv.citation_accuracy, answer: cv.answer.status, counts: cv.counts } } : {}),
+    ...(usage ? { usage } : {}),
+    model: reply.model,
+    reasoning: reply.reasoning,
+    confidence,
+    confidence_parts: { ...conf.parts, ...(c.operator !== null ? { operator: c.operator } : {}) },
+    length: { words: composed.words, target: frozen.words },
+    elaboration: { status: "ready" },
+    versions: { ...frozen.versions, reasoning_model: reply.model, prompt: PROMPT_VERSION },
+    timings,
+    notes: [...new Set(notes)],
+  };
+  const out: ElaborationResponse = { query_id: qid, status: "ready", answer, took_ms: Date.now() - t0 };
+  await keep(out);
+  await keepSuggestions(env, qid, answer.suggestions);
+  await env.CACHE.delete(elabKey(qid)).catch(() => {});
+  await env.DB.prepare("UPDATE ask_log SET model = ?, status = ?, confidence = ?, egs = ?, claims = ?, claims_supported = ?, input_tokens = ?, output_tokens = ?, cost_usd = ?, model_ms = ? WHERE qid = ?")
+    .bind(reply.model, lead.status, confidence, cv?.egs ?? null, cv?.claims.length ?? 0, cv?.claims.filter((x) => x.status === "supported").length ?? 0, usage?.input_tokens ?? null, usage?.output_tokens ?? null, usage?.cost_usd ?? null, usage?.model_ms ?? null, qid)
+    .run()
+    .catch(() => {});
+  return out;
+}
+
+// ---- /ask -----------------------------------------------------------------------------------------------------
+
 export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContext, "waitUntil">): Promise<AskResponseV4 | (AskResponse & { mode: "v3" })> {
   if (a.mode === "v3") return { ...(await askV3(env, a)), mode: "v3" as const };
   const t0 = Date.now();
@@ -220,6 +653,8 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
   if (cleaned.dropped.length) notes.push(`instructions inside the question were ignored: ${cleaned.dropped.map((x) => `“${x.slice(0, 80)}”`).join(" ")}`);
   const limit = Math.min(50, Math.max(1, a.limit ?? 10));
   const nsfw: NsfwMode = a.nsfw ?? "exclude";
+  const style = answerStyle(env, a.style);
+  const rich = style === "rich";
 
   // ---- plan, program, route, mode ----------------------------------------------------------------
   let tp = Date.now();
@@ -236,15 +671,18 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
   let route = routeQuestion(question, plan, program, { env, image: !!a.image });
   const task = a.image ? imageTask(question) : null;
   const needsSynthesis = route.class === "EXPLANATORY" || SUMMARY.test(fold(question)) || task === "describe";
-  // the caller's deepest mode caps everything; the search box's ceiling only what auto picks
+  // the caller's deepest mode caps everything; the search box's ceiling only what auto picks; rich
+  // answers raise what auto picks to SEARCH_RICH_MIN_MODE, so the model elaborates
   const most = maxModeFor(env, !!a.admin);
-  const chosen = chooseMode(env, a.mode, route, { needsSynthesis, ceiling: a.ceiling, max: most });
+  const chosen = chooseMode(env, a.mode, route, { needsSynthesis, ceiling: a.ceiling, max: most, floor: rich ? richMinMode(env) : undefined });
   const profile: ExecutionProfile = { ...PROFILES[chosen.mode] };
   const reasoningAsked = a.reasoning && a.reasoning !== "auto" && isReasoningLevel(a.reasoning) ? a.reasoning : null;
   const envReasoning = isReasoningLevel(env.SEARCH_REASONING) ? (env.SEARCH_REASONING as ReasoningLevel) : null;
   if (reasoningAsked) profile.reasoning = reasoningAsked;
   else if (envReasoning && profile.reasoning !== "none") profile.reasoning = envReasoning;
   const cap = int(env.SEARCH_MAX_OUTPUT_TOKENS, 6000);
+  // rich answers: the long-form reply's room (COMPOSE_TOKENS); brief: v4's
+  if (rich) profile.maxOutputTokens = COMPOSE_TOKENS[profile.mode];
   profile.maxOutputTokens = Math.min(cap, Math.max(64, a.max_output_tokens ? Math.min(a.max_output_tokens, profile.maxOutputTokens * 2) : profile.maxOutputTokens));
   if (!bool(env.SEARCH_RERANK, true)) profile.reranking = false;
   // the evidence the model reads: at most SEARCH_FINAL_K artwork cards, whatever the mode
@@ -309,7 +747,24 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
 
   // ---- evidence cards, graph, verification ------------------------------------------------------------
   tp = Date.now();
-  const chosenRows = selectCards(outcomes, profile, rerank, rerankBlend(env));
+  let chosenRows = selectCards(outcomes, profile, rerank, rerankBlend(env));
+  // an exact count over the filters ("how many artworks did @alice post?") keeps no rows: a rich
+  // answer shows, and gives the model, the newest posts of the set, so there is something to say
+  let metaRows: Verified[] = [];
+  let metaExtremes: { first?: Row | null; top?: Row | null } | undefined;
+  if (rich && !chosenRows.length && final.status === "ok" && final.scope?.kind === "metadata" && final.plan && !a.image) {
+    // the newest rows, and the set's oldest and most voted read exactly (three small SQL reads)
+    const meta = final.plan;
+    const req = final.scope.req;
+    const [rows, first, top] = await Promise.all([
+      metadataRows(env, { ...meta, intent: "find_last" }, req, Math.max(profile.cards, 24)).catch(() => [] as Row[]),
+      metadataRows(env, { ...meta, intent: "find_first" }, req, 1).catch(() => [] as Row[]),
+      metadataRows(env, { ...meta, intent: "top", sort: "votes" }, req, 1).catch(() => [] as Row[]),
+    ]);
+    metaRows = rows.map((row) => ({ row, v: { score: 1, lexical: 1, semantic: null, text: null, signals: ["matches the filters"] } }));
+    metaExtremes = { first: first[0] ?? null, top: top[0] ?? null };
+    chosenRows = metaRows.slice(0, profile.cards);
+  }
   const histories = new Map<string, HistoryFacts>();
   for (const o of outcomes) if (o.history) histories.set(o.history.post, o.history);
   const conceptOf = (o: StepOutcome) => o.plan?.concepts ?? [];
@@ -355,7 +810,8 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
   // nothing may be answered from: the question is asked back, or the deciding evidence failed verification (spec §16)
   const withheld = unnamed || invalidDecisive.length > 0;
   let resultText = det.text;
-  if (relevantConflicts.length) resultText = `${resultText} ${relevantConflicts.map((c) => conflictSentence(c, l, pathOfCard)).join(" ")}`;
+  const conflictText = relevantConflicts.map((c) => conflictSentence(c, l, pathOfCard)).join(" ");
+  if (relevantConflicts.length) resultText = `${resultText} ${conflictText}`;
 
   const hasDeterministic = det.complete && final.status === "ok" && !withheld;
   // the results the deterministic answer states: an explanation must state their values too
@@ -363,11 +819,11 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
 
   // ---- reasoning ------------------------------------------------------------------------------------------
   let reply: (ReasoningResponse & { cached?: boolean }) | null = null;
-  let cv: ClaimVerification | null = null;
   let model: string | null = null;
   const explicit = chosen.explicit || !!reasoningAsked;
-  // worth its cost (spec §53): asked for, a synthesis no operator gives, or evidence no operator could use
-  const worth = explicit || needsSynthesis || (!hasDeterministic && final.status === "ok" && cards.some((c) => c.type === "artwork"));
+  // worth its cost (spec §53): asked for, a synthesis no operator gives, evidence no operator could
+  // use — or, for rich answers, any answer the model may elaborate
+  const worth = explicit || needsSynthesis || rich || (!hasDeterministic && final.status === "ok" && cards.some((c) => c.type === "artwork"));
   // the model explains what the index found: never where it found nothing, a step failed, or the question is asked back
   const explainable = (status === "answered" || status === "conflict" || (task === "describe" && status === "no_match")) && !withheld;
   const useModel = profile.reasoning !== "none" && worth && explainable;
@@ -378,80 +834,66 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
   if (a.contextOnly) {
     return contextResponse();
   }
-  if (useModel) {
+  const words = rich ? wordTarget(env, profile.mode, a.length) : null;
+  const deferred = useModel && rich && !!a.defer;
+  if (useModel && !deferred) {
     model = pickModel(env, a, route, notes);
     tp = Date.now();
     try {
       reply = await generateCached(
         env,
         reasoningModel(env, model),
-        { question, evidence: modelCards as unknown as Array<{ evidence_id: string; type: string }>, reasoning: profile.reasoning, maxTokens: profile.maxOutputTokens, lang, context, task: "answer" },
+        { question, evidence: modelCards as unknown as Array<{ evidence_id: string; type: string }>, reasoning: profile.reasoning, maxTokens: profile.maxOutputTokens, lang, context, task: rich ? "compose" : "answer", ...(words ? { words } : {}) },
         a.noCache ? 0 : int(env.SEARCH_ANSWER_CACHE_TTL, 86400),
       );
     } catch (e) {
       notes.push(`reasoning model unavailable (${model}): ${e instanceof Error ? e.message : String(e)}${e instanceof LlmError && e.retryable ? " (transient)" : e instanceof UnusableReply ? " (unusable reply)" : ""}`);
     }
+    // what the model layer had to adapt (a reply cut off and salvaged, a reasoning level mapped): said, as the trace says it
+    if (rich && reply?.notes?.length) notes.push(...reply.notes);
     mark("reason", tp);
   }
 
   // ---- claim verification and the final answer -------------------------------------------------------------
   // spec §27: when the index answers, its answer is said first and the model only explains it; the
   // explanation is shown when its claims pass verification and it states the result's own values
-  let answerText = unnamed ? say("clarify_reference", l) : invalidDecisive.length ? say("insufficient", l) : resultText;
+  const answerText0 = unnamed ? say("clarify_reference", l) : invalidDecisive.length ? say("insufficient", l) : resultText;
+  let answerText = answerText0;
   let explanation: string | undefined;
   let rationale: string | undefined;
   let modelUsed = false;
+  let contradicted = false;
+  let cv: ClaimVerification | null = null;
+  const accounts = new Set<string>();
+  for (const c of cards) if (c.type === "artwork" || c.type === "post") accounts.add(c.author);
+  const leadInput: LeadInput = {
+    l,
+    resultText,
+    hasDeterministic,
+    shownCards,
+    usable,
+    accounts: [...accounts],
+    strictClaims: profile.strictClaims,
+    verifyClaimsOn: bool(env.SEARCH_VERIFY_CLAIMS, true),
+    task,
+    finalStatus: final.status,
+    status,
+    conflictText,
+    routeClass: route.class,
+    hasPremise: program.steps.some((s) => s.op === "premise"),
+    stripCitations: rich,
+  };
   if (reply) {
     tp = Date.now();
-    const accounts = new Set<string>();
-    for (const c of cards) if (c.type === "artwork" || c.type === "post") accounts.add(c.author);
-    cv = bool(env.SEARCH_VERIFY_CLAIMS, true) ? verifyClaims(reply, usable, { strict: profile.strictClaims, authors: accounts }) : null;
-    const agreement = hasDeterministic && cv ? agreesWithResult(reply.answer, shownCards, usable, { authors: accounts }) : { ok: true, problems: [] as string[] };
+    const lead = applyLead(leadInput, reply, answerText0);
+    ({ status, answerText, explanation, rationale, modelUsed, cv, contradicted } = lead);
+    notes.push(...lead.notes);
     mark("claims", tp);
-    const answerOk = !cv || cv.answer.status === "supported" || (cv.answer.status === "qualified" && !profile.strictClaims);
-    const explains = hasDeterministic || (task === "describe" && final.status === "no_match");
-    if (reply.status === "insufficient_evidence") {
-      if (explains) notes.push("the model judged the evidence insufficient; the index's own answer stands");
-      else {
-        status = "insufficient_evidence";
-        answerText = say("insufficient", l);
-      }
-    } else if (answerOk && agreement.ok && reply.answer.trim()) {
-      modelUsed = true;
-      if (explains) {
-        explanation = reply.answer.trim();
-        answerText = `${resultText} ${explanation}`.trim();
-        // "what is this image?" is answered by the description even when no indexed artwork is the same image
-        if (task === "describe" && status === "no_match") status = "answered";
-      } else {
-        answerText = reply.answer;
-        if (relevantConflicts.length && !/\d{4}-\d{2}-\d{2}.*\d{4}-\d{2}-\d{2}/.test(answerText)) answerText = `${answerText} ${relevantConflicts.map((c) => conflictSentence(c, l, pathOfCard)).join(" ")}`;
-      }
-      // a conflict is the evidence verifier's to find: the model's word alone does not change the status
-      if (reply.status === "conflict" && !relevantConflicts.length) notes.push("the model reported a conflict the evidence verifier did not find");
-    } else {
-      const why = !answerOk ? `${cv!.answer.status} (${cv!.answer.problems.join("; ").slice(0, 200)})` : !agreement.ok ? `it does not state the index's answer (${agreement.problems.join("; ").slice(0, 200)})` : "empty";
-      notes.push(`the model's ${explains ? "explanation" : "answer"} was not used: ${why}`);
-      if (!explains) {
-        const kept = cv ? keptClaims(cv, profile.strictClaims).filter((c) => c.kind !== "inference" || c.status === "supported") : [];
-        if (kept.length) {
-          modelUsed = true;
-          answerText = kept.map((c) => c.text).join(" ");
-        } else {
-          status = "insufficient_evidence";
-          answerText = say("insufficient", l);
-        }
-      }
-    }
-    // the rationale of a reply that was used, checked as strictly as the answer
-    const rationaleOk = !cv || cv.rationale?.status === "supported" || (!profile.strictClaims && cv.rationale?.status === "qualified");
-    if (modelUsed && reply.rationale && rationaleOk) rationale = reply.rationale;
   } else if (!hasDeterministic && final.status === "ok" && status === "answered") {
     status = "insufficient_evidence";
   }
-  // "why …?": the index holds what happened, not why. Without a grounded explanation from the
-  // model, the facts are given as facts and the question is not answered (a premise check is).
-  if (route.class === "EXPLANATORY" && status === "answered" && !explanation && !(modelUsed && !hasDeterministic) && !program.steps.some((s) => s.op === "premise")) {
+  // "why …?": the index holds what happened, not why (applyLead decides it when a model replied)
+  if (!reply && route.class === "EXPLANATORY" && status === "answered" && !program.steps.some((s) => s.op === "premise")) {
     status = "insufficient_evidence";
     answerText = `${say("insufficient", l)} ${resultText}`.trim();
   }
@@ -463,25 +905,50 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
   const inferred = decidingRows.some((x) => x.row.history_exact === 0);
   const ties = outcomes.some((o) => Array.isArray((o.result.details as any)?.tied) && (o.result.details as any).tied.length > 1);
   const rerankScore = rerank && decidingRows.length ? decidingRows.map((x) => rerank!.get(x.row.id)).filter((x): x is number => typeof x === "number") : [];
+  const confParts = {
+    retrieval: Math.min(1, retrieval) * (truncated ? 0.85 : 1) * (inferred ? 0.9 : 1),
+    reranking: rerankScore.length ? rerankScore.reduce((s, x) => s + x, 0) / rerankScore.length : null,
+    agreement: Math.max(0, 1 - 0.4 * relevantConflicts.length - (ties ? 0.5 : 0) - 0.1 * Math.max(0, ev.conflicts.length - relevantConflicts.length)),
+    // a question the rules decomposed into explicit operators is planned with certainty; v3's single-intent confidence otherwise
+    planConfidence: program.pattern === "single" ? plan.confidence : Math.max(plan.confidence, program.source === "rules" ? 0.9 : 0.75),
+  };
   const conf = combineConfidence(
     {
-      retrieval: Math.min(1, retrieval) * (truncated ? 0.85 : 1) * (inferred ? 0.9 : 1),
-      reranking: rerankScore.length ? rerankScore.reduce((s, x) => s + x, 0) / rerankScore.length : null,
-      agreement: Math.max(0, 1 - 0.4 * relevantConflicts.length - (ties ? 0.5 : 0) - 0.1 * Math.max(0, ev.conflicts.length - relevantConflicts.length)),
+      ...confParts,
       // what is shown: the index's answer (exact), with an explanation only when it passed verification
       verification: hasDeterministic ? (modelUsed && cv ? 0.5 + 0.5 * cv.egs : 1) : modelUsed ? (cv ? (cv.answer.status === "supported" ? 0.5 + 0.5 * cv.egs : 0.5 * cv.egs) : 0.6) : 0.3,
       model: modelUsed ? (reply?.confidence ?? null) : null,
-      // a question the rules decomposed into explicit operators is planned with certainty; v3's single-intent confidence otherwise
-      planConfidence: program.pattern === "single" ? plan.confidence : Math.max(plan.confidence, program.source === "rules" ? 0.9 : 0.75),
     },
     confidenceWeights(env),
   );
   let confidence = conf.value;
   // a deterministic answer is never surer than its operator (v3's confidence: ties, lower bounds,
   // inferred histories), whatever the model added to it
-  if (hasDeterministic && final.result.confidence > 0) confidence = r3(Math.min(confidence, final.result.confidence));
-  if (status === "no_match") confidence = r3(Math.min(confidence, final.result.confidence || confidence));
+  let confidenceCap: number | null = null;
+  if (hasDeterministic && final.result.confidence > 0) confidenceCap = final.result.confidence;
+  if (status === "no_match") confidenceCap = final.result.confidence || confidence;
+  if (confidenceCap !== null) confidence = r3(Math.min(confidence, confidenceCap));
   if (status === "insufficient_evidence" || status === "clarify" || status === "not_found") confidence = r3(Math.min(confidence, 0.3));
+
+  // ---- the long-form answer (v4.8) -----------------------------------------------------------------------------
+  tp = Date.now();
+  const validArt = artCards.filter((c) => c.valid !== false);
+  const hidden = (findings?.hidden ?? 0) + [...histories.values()].reduce((s, h) => s + (h.hidden ?? 0), 0);
+  const noDigest = withheld || status === "clarify" || status === "not_found" || !rich;
+  const digest: Digest = noDigest
+    ? { facts: [], overview: [], caveats: [], follow_ups: [], searches: [], stats: { posts: 0, read: 0, authors: [], tags: [], colors: [], exact: true }, about: [] }
+    : buildDigest({ lang, question, plan, program, outcomes, final, cards: validArt, results, histories, conflicts: relevantConflicts.map((c) => conflictSentence(c, l, pathOfCard)), hidden, rows: metaRows.length ? metaRows.map((x) => x.row) : undefined, extremes: metaExtremes });
+  // nothing matched: questions about the subject lead nowhere; the searches may
+  if (status === "no_match") digest.follow_ups = [];
+  const composed = await composeAnswer({ env, lang, question, style, lead: answerText, digest, reply, contradicted, usable, accounts, knownAuthors: ctx.authors, strict: profile.strictClaims, target: words, notes });
+  mark("compose", tp);
+  // the model a deferred answer will run (its notes, e.g. a model not available to this caller, belong to this answer)
+  const deferredModel = deferred ? pickModel(env, a, route, notes) : null;
+  const elaboration: AskResponseV4["elaboration"] = deferred
+    ? { status: "pending", url: elaborationUrl(queryId) }
+    : reply
+      ? { status: "inline" }
+      : { status: "none", reason: !rich ? "brief style" : !explainable ? "nothing to explain" : profile.reasoning === "none" ? "fast mode: no model" : useModel ? "the model did not answer" : "not worth a model call" };
 
   // ---- response ------------------------------------------------------------------------------------------
   const fplan = final.plan ?? plan;
@@ -491,6 +958,7 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
   const usage = reply?.usage ? { input_tokens: reply.usage.inputTokens, output_tokens: reply.usage.outputTokens, ...(reply.usage.reasoningTokens !== undefined ? { reasoning_tokens: reply.usage.reasoningTokens } : {}), cost_usd: reply.costUsd, model_ms: reply.latencyMs, ...(reply.cached ? { cached: true } : {}) } : undefined;
   const versions = {
     retrieval: RETRIEVAL_VERSION,
+    answer: ANSWER_VERSION,
     index: `${ctx.stats.posts}.${ctx.stats.artworks}.${ctx.stats.maxCreated}`,
     ranker: ctx.weights.version,
     reranker: rerankModel ? rerankerVersion(env) : null,
@@ -498,6 +966,36 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
     reasoning_model: reply ? reply.model : null,
     prompt: reply ? PROMPT_VERSION : null,
   };
+  if (deferred) {
+    const frozen: FrozenElaboration = {
+      v: 1,
+      query_id: queryId,
+      question,
+      lang,
+      mode: profile.mode,
+      reasoning: profile.reasoning,
+      maxOutputTokens: profile.maxOutputTokens,
+      strictClaims: profile.strictClaims,
+      model: deferredModel!,
+      words: words ?? wordTarget(env, profile.mode, a.length),
+      modelCards,
+      context,
+      lead: leadInput,
+      answerText0,
+      digest,
+      text: a.text === "full" ? "full" : "short",
+      notes: [...new Set(notes)],
+      confidence: { parts: { retrieval: confParts.retrieval, reranking: confParts.reranking, agreement: confParts.agreement }, planConfidence: confParts.planConfidence, operator: hasDeterministic ? r3(final.result.confidence) : null, operatorConfidence: final.result.confidence, hasDeterministic },
+      versions,
+      cacheTtl: a.noCache ? 0 : int(env.SEARCH_ANSWER_CACHE_TTL, 86400),
+      at: now(),
+      attempts: 0,
+    };
+    // written before the answer goes out: the box fetches the elaboration right away
+    await env.CACHE.put(elabKey(queryId), JSON.stringify(frozen), { expirationTtl: elaborationTtl(env) }).catch((e) => {
+      notes.push(`the elaboration could not be deferred: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }
   timings.total = Date.now() - t0;
   if (reply) timings.model = reply.latencyMs;
   const res: AskResponseV4 = {
@@ -505,7 +1003,7 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
     status,
     answer: withheld ? null : (final.result.answer as string | number | null),
     answer_type: withheld ? "none" : final.result.answerType,
-    answer_text: answerText,
+    answer_text: a.text === "full" ? composed.full : answerText,
     // a question asked back, or evidence that failed verification: no result, evidence or items to show
     ...(!withheld && (hasDeterministic || final.status === "no_match") ? { result_text: resultText } : {}),
     ...(explanation ? { explanation } : {}),
@@ -551,30 +1049,46 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
         }
       : {}),
     took_ms: Date.now() - t0,
+    // v4.8
+    style,
+    answer_short: answerText,
+    answer_full: composed.full,
+    answer_markdown: composed.markdown,
+    sections: composed.sections,
+    thinking: composed.sections.thinking,
+    suggestions: { follow_ups: composed.sections.follow_ups, searches: composed.sections.searches },
+    digest: { stats: digest.stats, about: digest.about },
+    length: { words: composed.words, target: useModel && rich ? words : null },
+    elaboration,
   };
   const wantTrace = a.trace && (a.admin || bool(env.SEARCH_TRACE, false));
   const trace = {
     route: { class: route.class, complexity: route.complexity, band: route.band, signals: route.signals, reason: route.reason },
-    mode: { mode: profile.mode, explicit: chosen.explicit, needs_synthesis: needsSynthesis, profile },
+    mode: { mode: profile.mode, explicit: chosen.explicit, needs_synthesis: needsSynthesis, style, profile },
     program: { pattern: program.pattern, source: program.source, steps: program.steps.map((s) => ({ id: s.id, op: s.op, text: s.text, refs: s.refs })) },
     steps: outcomes.map((o) => ({ id: o.step.id, status: o.status, legs: o.scope?.legs ?? {}, candidates: o.scope?.all.length ?? 0, verified: o.scope?.verified.length ?? 0, ms: o.ms, top: o.result.evidence.slice(0, 5).map((x) => ({ id: x.row.id, score: x.v.score, signals: x.v.signals })) })),
     rerank: rerank ? { model: rerankModel, scores: [...rerank.entries()].slice(0, 20).map(([id, s]) => ({ id, score: r3(s) })) } : null,
     evidence: { cards: cards.length, invalid: Object.fromEntries(ev.invalid), conflicts: ev.conflicts.length, duplicates: ev.duplicates },
-    reasoning: reply ? { model: reply.model, status: reply.status, usage: reply.usage, finish: reply.finishReason, cached: !!reply.cached, notes: reply.notes } : null,
+    reasoning: reply ? { model: reply.model, status: reply.status, usage: reply.usage, finish: reply.finishReason, cached: !!reply.cached, salvaged: !!reply.salvaged, notes: reply.notes } : null,
     claims: cv ? { counts: cv.counts, egs: cv.egs, answer: cv.answer } : null,
+    compose: { words: composed.words, target: words, body: composed.body ? { removed: composed.body.removed, egs: composed.body.egs, citation_accuracy: composed.body.citation_accuracy, sentences: composed.body.claims.map((c) => ({ text: c.text.slice(0, 120), status: c.status, problems: c.problems })) } : null, removed: composed.removed, deferred },
     image: findings ? { task, legs: findings.legs, origin: findings.origin, appearances: findings.appearances.length, hidden: findings.hidden, described: !!imageCard?.description } : null,
     timings,
     // what the model was given and what was kept of its reply: a fine-tuning example once verified (GET /admin/ask/export-sft)
     ...(reply ? { model_input: { cards: modelCards, context, lang }, model_output: { used: modelUsed, status: reply.status, answer: modelUsed ? (explanation ?? answerText) : null, claims: (cv ? keptClaims(cv, profile.strictClaims) : reply.claims).map((c) => ({ text: c.text, evidence: c.evidence, kind: c.kind })), rationale: rationale ?? null } } : {}),
   };
   if (wantTrace) res.trace = trace;
-  const logged = logAsk(env, res, trace).catch(() => {});
-  if (exec) exec.waitUntil(logged);
-  else await logged;
+  const after: Promise<unknown>[] = [logAsk(env, res, trace).catch(() => {})];
+  // the box's dropdown continues the conversation: GET /suggest?after=<query_id>
+  if (rich && (res.suggestions.follow_ups.length || res.suggestions.searches.length)) after.push(keepSuggestions(env, queryId, res.suggestions));
+  const settled = Promise.all(after);
+  if (exec) exec.waitUntil(settled);
+  else await settled;
   return res;
 
   function contextResponse(): AskResponseV4 {
     timings.total = Date.now() - t0;
+    const lead = resultText;
     return {
       question: original,
       status,
@@ -600,12 +1114,22 @@ export async function ask(env: Env, a: AskRequestV4, exec?: Pick<ExecutionContex
       cards,
       evidence: final.result.evidence.map((x) => ({ ...evidenceOf(x.row, x.v), evidence_id: `E${x.row.id}` })),
       items: [],
-      versions: { retrieval: RETRIEVAL_VERSION, index: `${ctx.stats.posts}.${ctx.stats.artworks}.${ctx.stats.maxCreated}`, prompt: PROMPT_VERSION },
+      versions: { retrieval: RETRIEVAL_VERSION, answer: ANSWER_VERSION, index: `${ctx.stats.posts}.${ctx.stats.artworks}.${ctx.stats.maxCreated}`, prompt: PROMPT_VERSION },
       timings,
       notes,
       query_id: queryId,
       took_ms: Date.now() - t0,
-      trace: { context, model_cards: modelCards, lang, profile, has_deterministic: hasDeterministic, shown: shownCards.map((c) => c.evidence_id) },
+      trace: { context, model_cards: modelCards, lang, profile, has_deterministic: hasDeterministic, shown: shownCards.map((c) => c.evidence_id), style, words: rich ? wordTarget(env, profile.mode, a.length) : null },
+      style,
+      answer_short: lead,
+      answer_full: lead,
+      answer_markdown: lead,
+      sections: { lead, facts: [], overview: [], thinking: [], caveats: [], follow_ups: [], searches: [] },
+      thinking: [],
+      suggestions: { follow_ups: [], searches: [] },
+      digest: { stats: { posts: 0, read: 0, authors: [], tags: [], colors: [], exact: true }, about: [] },
+      length: { words: 0, target: null },
+      elaboration: { status: "none", reason: "context only" },
     };
   }
 }
@@ -619,7 +1143,7 @@ function dedupeRows(xs: Verified[]): Verified[] {
 export function fitTrace(trace: Record<string, unknown>, max = 32_000): string {
   let t = { ...trace };
   let json = JSON.stringify(t);
-  for (const k of ["model_input", "model_output", "rerank", "steps", "evidence", "program"]) {
+  for (const k of ["model_input", "model_output", "compose", "rerank", "steps", "evidence", "program"]) {
     if (json.length <= max) break;
     t = { ...t, [k]: "(dropped: trace too large)" };
     json = JSON.stringify(t);

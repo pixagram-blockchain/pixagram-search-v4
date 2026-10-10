@@ -150,3 +150,19 @@ describe("questions about an uploaded image", () => {
     expect((await askImage(env, "", heart)).status).toBe(400);
   });
 });
+
+describe("v4.8: a rich answer about an uploaded image", () => {
+  it("carries the facts of the posts that show the image, caveats about similarity, and follow-ups about them; the model is not needed", async () => {
+    const env = await gallery();
+    const r = await askImage(env, "Who posted this first?", heart, { style: "rich", mode: "fast" });
+    expect(r.status).toBe(200);
+    expect(r.body.style).toBe("rich");
+    expect(r.body.answer_text).toBe("This image was first posted by @alice on 2026-09-01, in “Heart”. It appears in 1 other post too.");
+    expect(r.body.sections.facts[0]).toMatch(/^“Heart” by @alice: posted on 2026-09-01; tagged heart/);
+    expect(r.body.sections.facts.some((f: string) => f.startsWith("“My heart” by @bob"))).toBe(true);
+    expect(r.body.answer_full).toContain("From the index:");
+    expect(r.body.suggestions.follow_ups.map((f: any) => f.text)).toEqual(expect.arrayContaining(["Was “Heart” edited?", "Was “Heart” reposted?"]));
+    expect(r.body.elaboration).toEqual({ status: "none", reason: "fast mode: no model" });
+    expect(env._ai.calls.filter((c) => !c.model.includes("embed"))).toEqual([]);
+  });
+});

@@ -1,5 +1,9 @@
 # pixagram-search v4: what it adds, where the specification lives in the code, what was measured
 
+**v4.8 (October 2026): the long-form answers.** The engine below is unchanged; what a reader gets
+from it is not. See "v4.8: the long-form answers" at the end of this file, and README.md "Rich
+answers" for the API.
+
 v4 is v3's deterministic search with a retrieval, verification and reasoning engine built around
 it (the "Pixagram Search v4 Specification", 63 sections). The rule it is built on (spec §61): the
 Pixagram index decides what happened; a model may only explain it. Concretely:
@@ -81,7 +85,7 @@ response (v3's fields + v4's), ask_log row, sampled trace                     as
 | 53 | cost control | `ask.ts` (`worth`), `llm/model.ts` (prices) | a model only when asked for, for a synthesis, or when no operator answers |
 | 54 | latency | `evaluation/models.ts`, offline harness | engine P50/P95/P99 apart from model latency |
 | 56 | backward compatibility | `test/v4-v3-parity.test.ts`, `test/fixtures/v3-answers.json` | v3's routes, parameters and fields unchanged |
-| 57–58 | configuration, initial models | `wrangler.jsonc` | gpt-oss-120b reasoning, Gemma 4 planner, Nemotron 3 help, bge-reranker-base |
+| 57–58 | configuration, initial models | `wrangler.jsonc` | v4: gpt-oss-120b reasoning, Gemma 4 planner, Nemotron 3 help, bge-reranker-base; v4.8.1: GLM-5.3-Flash reasoning and help, GLM-5.3 for the deep band ("Models, October 2026" below) |
 
 ## Decisions worth knowing
 
@@ -514,7 +518,7 @@ budgets are configuration (`PAPH_BUDGET_QUERY`, `PAPH_BUDGET_STAGE`).
 
   ```bash
   ADMIN_TOKEN=… python3 scripts/benchmark.py https://pixagram-search-v4.<you>.workers.dev \
-      --models @cf/openai/gpt-oss-120b,@cf/nvidia/nemotron-3-120b-a12b,@cf/google/gemma-4-26b-a4b-it,@cf/meta/llama-3.3-70b-instruct-fp8-fast,@cf/moonshotai/kimi-k2.6 \
+      --models @cf/zai-org/glm-5.3-flash,@cf/zai-org/glm-5.3,@cf/deepseek-ai/deepseek-v4-flash-0731,@cf/openai/gpt-oss-120b,@cf/qwen/qwen3.8-27b \
       --reasoning medium --limit 60 --out bench.json
   ```
 
@@ -558,3 +562,215 @@ budgets are configuration (`PAPH_BUDGET_QUERY`, `PAPH_BUDGET_STAGE`).
    questions, and only then consider training the reranker on the LTR pairs or fine-tuning a
    model on the SFT exports (spec §36-40).
 4. Colour queries (nDCG@10 0.750) are the weakest retrieval category.
+
+## v4.8: the long-form answers
+
+v4's answers were short by design: the index's one sentence, and a model's explanation of one to
+three sentences that the engine dropped whole when a single claim failed. Most questions never
+reached a model at all (fast mode), the model's reasoning never reached the reader (spec §21), and
+nothing suggested what to ask next. v4.8 keeps the rule that made v4 trustworthy — the index
+decides what happened, the model only explains it, and nothing unverified is shown — and builds
+the answer people wanted on top of it. Nothing of the retrieval, the operators, the evidence
+verification or the claim atoms changed; `mode=v3` and `style=brief` answer exactly as before (the
+v3 and v4 suites run with `SEARCH_ANSWER_STYLE=brief` and pass unchanged, 701 of the 726 tests).
+
+### What it adds
+
+```
+answer (as v4) ─► digest.ts      facts about the deciding posts, the set's overview, caveats,
+                                  template follow-ups, searches — computed values only, five
+                                  languages, no model call; always there
+               ─► compose task   the model (balanced and above; rich raises auto to balanced):
+                                  direct answer + body (Markdown, every sentence cited) + reasoning
+                                  trail + caveats + follow-ups + searches, in one JSON reply
+               ─► compose.ts     the body verified sentence by sentence against the cards (claims.ts
+                                  atoms + contradictions, addresses, accusations; headings too), the
+                                  trail and the caveats step by step; follow-ups and searches filtered
+                                  (names in the evidence, no address, planned by the rules, words of
+                                  the evidence, help only when the documentation covers it)
+               ─► assembly       answer_markdown (citations kept) and answer_full (plain), sections,
+                                  thinking, suggestions; answer_text stays the direct answer
+defer=1        ─► the frozen context in KV; GET /ask/elaboration/:id runs the model once (marker,
+                  three attempts at most), returns the changed fields; /suggest?after=:id continues
+/query, /search ─► overview.ts: a text overview of a result page (five languages)
+/help          ─► style rich: a complete answer at length, follow-ups the documentation covers,
+                  the related sections of the cited pages
+```
+
+| what | where |
+|---|---|
+| the compose task, its schema and prompt (`PROMPT_VERSION` v4.8) | `src/llm/prompts.ts` |
+| the reply parsed and bounded; a reply cut off at the token limit salvaged by a top-level partial-JSON scan (the model's status respected) | `src/llm/reasoning.ts` |
+| the digest: facts, overview (exact oldest and most voted through SQL on the metadata path), caveats, templates per family and language, searches | `src/search/digest.ts` |
+| sentence-level verification, the suggestion checks, the assembly and the section titles | `src/search/compose.ts` |
+| `citedInterpretations` (a cited sentence without atoms: supported at ≥ 25 % word overlap, qualified below), `unknownNames`, the accusation vocabulary | `src/search/claims.ts` |
+| the long-form flow, the mode floor, the set's rows as cards, the deferred path | `src/search/ask.ts` (`applyLead`, `composeAnswer`, `elaborate`) |
+| the search overview | `src/search/overview.ts` |
+| rich help: prompt, follow-ups, related sections | `src/help/answer.ts` |
+| `/suggest?after=` | `src/search/suggest.ts suggestAfter` |
+| the benchmark on the compose task (`body` grounding and length per model) | `src/evaluation/benchmark.ts`, `scripts/benchmark.py --task compose` |
+
+### Decisions worth knowing
+
+- **A sentence, not a reply, is the unit of verification.** v4 checked the explanation as one
+  claim: one atom the evidence did not hold, and three sentences were gone. A 300-word body would
+  almost always lose a sentence somewhere, so the body is split into sentences (list items and
+  headings included), each verified with the same atoms, contradiction tests and ownership rules
+  as a claim, and only the failing ones are removed. The review measured on the fixture: a body
+  with a made-up post, an address and an empty heading keeps its seven good sentences and loses
+  the three bad ones.
+- **The index still speaks first.** `answer_text` is `result_text` then the model's direct
+  answer, judged as in v4 (`agreesWithResult`); a direct answer that contradicts the result drops
+  the whole reply, body and trail included, because a model that got the main fact wrong is not
+  trusted on the rest. A model that only fails to restate the value keeps its verified body.
+- **"Thinking" is a written trail, never the chain of thought.** Spec §21 stands: the adapters
+  drop the models' reasoning. What the reader sees under "How this was worked out" is a list of
+  steps the model wrote for the reader, each citing cards and each verified as a claim; steps that
+  fail are removed and the rest renumbered. It is checkable, which the raw reasoning is not.
+- **The digest can never be wrong about the index, so it says only what it read.** An exact count
+  reads the set's newest 24 posts, and its oldest and most voted by SQL, so the range and the most
+  voted are the set's; tags and colours are said of the rows read. A search overview says "Of the
+  20 shown: …" when the page is not the whole set.
+- **Follow-ups must lead somewhere, and must be safe to show.** A model's question is kept only
+  when every account, title, number and date in it is in the evidence, it carries no address and
+  no accusation, the rules plan it with confidence, and its subject is made of words the evidence
+  carries (or, for a help question, the documentation covers it). The templates (per family —
+  author, subject, named post — and language) are checked against the planner in the tests:
+  every one of them is a question the index answers. In French, German, Spanish and Italian the
+  subject is attached to a noun of fixed gender (« œuvre de chat », „Kunstwerk mit Katze“, «obra
+  de gato», «opera di gatto»): a typed subject has no gender or number a template could know.
+- **Brief is v4.** Token budgets, the search box's ceiling, prompts and fields of the brief style
+  are v4's; only the prompt version moved (every cache key changes with it).
+- **A deferred answer costs at most three model calls.** The frozen context is written before the
+  answer goes out; a marker holds while the model runs, so overlapping polls wait; a transient
+  failure is tried again by the next call up to three times, a reply the engine cannot use is
+  final; the result and a final failure are kept for `SEARCH_ELABORATION_TTL`.
+
+### Measured
+
+Offline, in this repository's harness (Node, SQLite for D1, the models as test doubles that
+answer with fixed replies): `npm test` — 726 tests, 25 of them v4.8's (`test/v4-rich.test.ts`,
+and one in `test/v4-visual.test.ts`): the digest in five languages, every follow-up template
+planned and answered (over 60 generated questions), the body verification on a reply with a
+made-up post, an address, an accusation and an empty heading, the trail and the caveats, the
+mode floor and the budgets per style, a contradicting lead, a salvaged reply, the deferred flow
+over HTTP with its failures and its marker, `/query` and `/search` overviews, `/suggest?after=`,
+rich `/help`, and an image question. `npm run typecheck` and `wrangler deploy --dry-run` (2,349
+KiB, 772 KiB gzipped) pass. An independent review of the first cut found eleven issues (the
+deferred route open to repeated model calls, a race on the frozen context, headings and
+follow-ups reaching the reader unverified, page-level superlatives stated as the set's, two
+budgets changed under the brief style, templates ungrammatical in four languages, a salvaged
+reply ignoring the model's status, the abbreviation rule merging real sentences); all are fixed
+and tested in this release.
+
+**Not verified here:** the models' replies to the compose prompt (how long gpt-oss-120b's bodies
+come out, how many sentences the verification removes on real questions, the follow-ups it
+proposes) — `scripts/benchmark.py --task compose` measures them once deployed (`body` grounding,
+words, share of sentences kept, per model); Workers AI latency on the longer replies
+(`SEARCH_LLM_TIMEOUT_MS` is 60 s; `timings.model` in every answer measures it); KV propagation
+delays between the deferred answer and its first poll (the frozen context is written and awaited
+before the answer is returned; a poll that still finds nothing is a 404 the box may retry once).
+
+### Next
+
+1. Deploy, then `scripts/benchmark.py --task compose --words 250` on the models of v4.8.1
+   (the script's default list): confirm `SEARCH_REASONING_MODEL` by body grounding (`body EGS`,
+   `kept%`) as much as by agreement, and set `SEARCH_ANSWER_WORDS` from the lengths that come out.
+2. Watch `ask_log` and the notes: the sentences removed per answer (`trace.compose.body`) say
+   where the prompt or the evidence cards fall short; follow-ups dropped say which templates to
+   add.
+3. The UI: `answer_markdown`, the reasoning trail as a collapsible, follow-ups as chips, the
+   overview above the grid, `defer=1` with `/suggest?after=`.
+
+## v4.8.1: the models of October 2026
+
+v4 made every model configuration; v4.8.1 changes the configuration where a stronger model is
+certain, and teaches the engine what those models need. Nothing else moves: the index, the
+evidence, the verification and the prompts are v4.8's.
+
+### What changed
+
+| role | v4 | v4.8.1 | why |
+|---|---|---|---|
+| reasoning, every band | gpt-oss-120b ($0.35 / $0.75) | **GLM-5.3-Flash** `@cf/zai-org/glm-5.3-flash` ($0.15 / $0.50) | the strongest small model Workers AI serves (Artificial Analysis index 42 against gpt-oss-120b's 12), at less than half the price; MIT; 1M context |
+| reasoning, deep band | (the same) | **GLM-5.3** `@cf/zai-org/glm-5.3` ($1.40 / $4.40) | the full model (index 45) for the multi-hop and comparative questions (complexity ≥ 0.85); ten times the price per token and slower, on the rarest band; `SEARCH_REASONING_MODEL_DEEP` |
+| help | Nemotron 3 Super ($0.50 / $1.50) | **GLM-5.3-Flash** | the better writer at a third of the price; help answers are checked sentence by sentence either way |
+| documentation vectors | bge-m3 | **Qwen3-Embedding-0.6B** `@cf/qwen/qwen3-embedding-0.6b` | ahead of bge-m3 on the multilingual retrieval benchmarks, same 1024 dimensions (VEC_DOCS is kept), same price ($0.0118); questions are embedded with the retrieval instruction, as the model was trained |
+| planner | Gemma 4 | Gemma 4 | plans with reasoning off, which GLM cannot; the follow-up templates of v4.8 were checked through it |
+| descriptions | Gemma 4 | Gemma 4, with the `chat` backend ready | GLM-5.3-Flash is multimodal, but nothing says it describes pixel art better than Gemma 4: `VLM_BACKEND=chat` + `VLM_MODEL` switch it once `scripts/admin.sh describe <id> chat` has been compared on a few artworks |
+| reranker, image and text vectors | bge-reranker-base, SigLIP 2 | unchanged | no better cross-encoder on Workers AI; SigLIP stays on the Space |
+
+The change is in `wrangler.jsonc`: the code's own fallbacks for an unset variable stay v4's
+(gpt-oss-120b, bge-m3, Gemma 4), so a stack that keeps its variables keeps its models.
+
+What that does to a request: GLM reasons in every call (`reasoning_effort` low, high or max; it
+cannot be switched off, so the engine's "none" runs as "low"), so `SEARCH_REASONING_TOKENS` is
+raised to `low:2048,medium:6144,high:16384` and `SEARCH_LLM_TIMEOUT_MS` to 120 s. In balanced
+mode (the search box's floor for rich answers) a question costs about $0.001–0.004 on Flash; a
+deep-band question on GLM-5.3 about ten times that, and it may take a minute — which `defer=1`
+hides from the box.
+
+### What the engine learnt
+
+- **A reasoning control in the model's own words** (`src/llm/model.ts`, `effort`): each level of
+  the engine mapped to the model's value, and how "none" is asked for — an effort of its own
+  (DeepSeek V4: `none`), the chat template (Qwen3.8), or not at all (GLM: "none" runs as "low").
+  The table knows GLM-5.3, GLM-5.3-Flash, Qwen3.8-27B, DeepSeek V4 Flash and Pro with their
+  prices; `/admin/models` lists them. An unknown `@cf/` id is still taken as a legacy chat
+  model, so a new model is declared in the table or in `SEARCH_MODEL_OVERRIDES` before it is
+  configured. The budget of a call adds the reasoning allowance whenever the model will reason,
+  including at "none" on a model that cannot stop.
+- **Qwen3-Embedding's two sides** (`src/docs/vectors.ts`): chunks are embedded as documents
+  (`{text}`), questions as queries with the retrieval instruction (`{queries, instruction}`;
+  `DOCS_QUERY_INSTRUCTION` overrides the built-in sentence). The question-vector cache key
+  carries a version, so no bge-m3 vector is read back for a Qwen3 query.
+- **The `chat` description backend** (`src/enrich/describe.ts`): any vision chat model the table
+  knows (or an override declares), named by `VLM_MODEL`; a misconfigured one skips the stage
+  with the reason in the job (`VLM_BACKEND=chat needs VLM_MODEL …`) instead of failing every
+  image. The stage's staleness is by content hash, so a model change describes new and edited
+  images only; `scripts/admin.sh reindex-all describe` redoes them all.
+- **The retrieval on its own** (`GET /admin/debug/docs?q=…`, `scripts/admin.sh docs-retrieve`):
+  each chunk's lexical coverage, raw cosine and combined score — the tool for `DOCS_MIN_SCORE`.
+
+### After deploying, in this order
+
+1. `scripts/deploy.sh` — the Worker with the new variables (the Space is untouched).
+2. `scripts/admin.sh docs-reembed` — every chunk re-embedded on Qwen3 (2,000 in the first call,
+   the rest by the following syncs; `scripts/admin.sh docs` shows what is pending). Until it is
+   done, a question's Qwen3 vector meets bge-m3 chunk vectors: the vector leg is noise and help
+   relies on its lexical leg (and does not cache its answers meanwhile).
+3. Set `DOCS_MIN_SCORE`: `scripts/admin.sh docs-retrieve "<question>"` for a dozen questions
+   the documentation answers and a few it does not; the cosines of the right chunks sit above
+   those of the wrong ones, and the line goes between them. It is the cosine at which a chunk
+   counts as relevant by its vector alone (`help/retrieve.ts`: a cosine 0.15 below it scores 0,
+   0.15 above it 1); 0.4 is where the configuration starts, not a measurement.
+4. `scripts/benchmark.py --task compose --words 250` (its default list is v4.8.1's five models)
+   confirms the reasoning model on Pixagram's own questions: body grounding, sentences kept,
+   agreement, cost and latency per model.
+5. Watch `scripts/admin.sh ask-log`: `timings.model` per mode and model, and replies whose
+   reasoning used up the budget (`finish_reason: length` in the trace; the deterministic answer
+   still shows). If deep-band answers time out, point `SEARCH_REASONING_MODEL_DEEP` at the Flash
+   model or lower `SEARCH_REASONING_TOKENS`.
+6. Optional: `scripts/admin.sh describe <id> chat` against `describe <id> gemma` on a handful of
+   artworks; `VLM_BACKEND=chat` if GLM's descriptions read better.
+
+### Measured
+
+Offline: `npm test` — 743 tests, 17 of them v4.8.1's (`test/models-2026-10.test.ts`): the
+request shape of every new model at every level, the budget at "none" on a model that cannot
+stop reasoning, the provider's note and the cost, the deployed configuration read from
+`wrangler.jsonc`, Qwen3's document and query inputs through a synced index and the versioned
+cache key, the retrieval debug route, the `chat` backend through the enrichment pipeline and its
+skip reason. `npm run typecheck` and `wrangler deploy --dry-run` pass.
+
+### Not verified here
+
+No Workers AI call could be made from this environment. The request shapes follow the models'
+Workers AI input schemas as published in October 2026; what only a live call shows:
+`reasoning_effort`'s accepted values on the binding (a refused field is retried without it,
+with a note in the answer), where GLM returns its reasoning (the adapter reads
+`choices[0].message.content` and skips `reasoning` parts), how many tokens each effort level
+spends and how long it takes on Workers AI, Qwen3-Embedding's `{queries, instruction}` input
+through the binding and the cosines it gives on the documentation (hence step 3 above), and
+whether GLM-5.3-Flash describes pixel art better than Gemma 4 (hence step 6). The prices in
+the table are the model pages' of October 2026.

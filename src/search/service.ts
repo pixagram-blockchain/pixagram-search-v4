@@ -112,6 +112,8 @@ export interface SearchResponse {
   /** v4: whether the cross-encoder reordered the top of the ranking, and which */
   reranked?: boolean;
   reranker?: string;
+  /** v4.8: a text overview of the page (/search?overview=1, and every search of /query in the rich style) */
+  overview?: import("./overview").SearchOverview;
 }
 
 type Row = Record<string, any>;

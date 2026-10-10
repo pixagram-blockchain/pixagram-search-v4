@@ -1,11 +1,18 @@
 // AI description of an artwork via Workers AI.
 //
-//   moondream  @cf/moondream/moondream3.1-9B-A2B: "query" task asking for JSON, then the
-//              "caption" task as a fallback when the JSON is unusable (default)
-//   caption    Moondream "caption" task only (cheapest; caption without tags)
-//   scout      @cf/meta/llama-4-scout-17b-16e-instruct with a JSON schema
+//   chat       the vision chat model named by VLM_MODEL (v4.8.1: @cf/zai-org/glm-5.3-flash on the
+//              deployed stack), with a JSON schema; any model the table (src/llm/model.ts) knows as
+//              vision-capable, or one SEARCH_MODEL_OVERRIDES declares so
 //   gemma      @cf/google/gemma-4-26b-a4b-it with a JSON schema, reasoning off (per token the
-//              cheapest of the three on Workers AI in October 2026)
+//              cheapest of the table's vision models on Workers AI in October 2026)
+//   scout      @cf/meta/llama-4-scout-17b-16e-instruct with a JSON schema
+//   moondream  @cf/moondream/moondream3.1-9B-A2B: "query" task asking for JSON, then the
+//              "caption" task as a fallback when the JSON is unusable
+//   caption    Moondream "caption" task only (cheapest; caption without tags)
+//
+// The stage's staleness is by content hash (artworks.describe_hash), not by model: a backend or
+// model change describes new and edited images with the new model and leaves the rest as they are
+// (`scripts/admin.sh reindex-all describe` redoes them all).
 //
 // v2 bug fixed here: when Moondream's reply had no usable `answer`, v2 fell back to
 // JSON.stringify(reply) and parsed the *envelope* ({finish_reason, metrics, answer: null, ...}) as a
@@ -15,6 +22,7 @@
 
 import type { Env } from "../env";
 import { complete } from "../llm/provider";
+import { isModelId, modelSpec } from "../llm/model";
 import { MOONDREAM_MODEL, moondreamCaption, moondreamQuery, replyText } from "../llm/adapters/moondream";
 
 export interface Description {
@@ -32,12 +40,34 @@ export { MOONDREAM_MODEL, replyText };
 export const SCOUT_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 export const GEMMA_MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
-export const VLM_BACKENDS = ["moondream", "caption", "scout", "gemma"] as const;
+export const VLM_BACKENDS = ["chat", "gemma", "scout", "moondream", "caption"] as const;
 export type VlmBackend = (typeof VLM_BACKENDS)[number];
 export const isVlmBackend = (x: string): x is VlmBackend => (VLM_BACKENDS as readonly string[]).includes(x);
 
 /** Chat models that take the image as a message part and answer in JSON-schema mode. */
 const CHAT_VLM: Partial<Record<VlmBackend, string>> = { scout: SCOUT_MODEL, gemma: GEMMA_MODEL };
+
+/**
+ * Why the "chat" backend cannot run as configured (no VLM_MODEL, not a model id, not a vision
+ * model), else null. The consumer skips the stage with this reason instead of failing every image;
+ * the other backends have nothing to configure.
+ */
+export function vlmConfigError(env: Pick<Env, "VLM_MODEL" | "SEARCH_LLM_ENDPOINTS" | "SEARCH_MODEL_OVERRIDES">, backend: VlmBackend): string | null {
+  if (backend !== "chat") return null;
+  const id = (env.VLM_MODEL ?? "").trim();
+  if (!id) return "VLM_BACKEND=chat needs VLM_MODEL (a vision chat model id)";
+  if (!isModelId(id, env as Env)) return `VLM_MODEL "${id}" is not a model id this engine can call`;
+  if (!modelSpec(id, env as Env).vision) return `VLM_MODEL "${id}" is not known as a vision model (SEARCH_MODEL_OVERRIDES can declare {"${id}": {"vision": true}})`;
+  return null;
+}
+
+/** The chat model a backend describes with (null for the Moondream tasks). Throws on a misconfigured "chat" backend. */
+export function chatVlmModel(env: Env, backend: VlmBackend): string | null {
+  if (backend !== "chat") return CHAT_VLM[backend] ?? null;
+  const err = vlmConfigError(env, backend);
+  if (err) throw new Error(err);
+  return env.VLM_MODEL!.trim();
+}
 
 export class EmptyDescription extends Error {
   constructor(msg: string, public readonly raw: string) {
@@ -169,7 +199,7 @@ export async function describeImage(
   const prompt = buildPrompt(ctx);
   const raws: string[] = [];
 
-  const chat = CHAT_VLM[backend];
+  const chat = chatVlmModel(env, backend);
   if (chat) {
     // through the model layer (src/llm): the request shape per model lives in its adapter
     const r = await complete(env, {

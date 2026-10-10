@@ -1,9 +1,11 @@
 // /ask: questions answered from the index's evidence (search/ask.ts), and votes on the answers.
 //
-//   GET  /ask?q=…&mode=…&reasoning=…
+//   GET  /ask?q=…&mode=…&reasoning=…&style=rich|brief&text=short|full&length=short|medium|long&defer=1
 //   POST /ask {"question": "…", "mode": "auto|fast|balanced|deep|expert|v3", "reasoning": "auto|none|low|medium|high",
-//              "model": "…", "max_output_tokens": 1500, "trace": true, "graph": true, "image": "<base64 or data URI>"}
+//              "model": "…", "max_output_tokens": 1500, "trace": true, "graph": true, "image": "<base64 or data URI>",
+//              "style": "rich", "text": "short", "length": "medium", "defer": false}
 //   POST /ask (multipart: image + question + the same fields) — a question about an uploaded image
+//   GET  /ask/elaboration/:query_id — the model's part of an answer asked with defer=1 (README "Rich answers")
 //   POST /ask/feedback {"query_id": "…", "rating": 1 | -1, "reason": "wrong|unsupported|incomplete|other"}
 //
 // Public callers: modes up to SEARCH_MAX_MODE (default deep), reasoning up to medium, the models of
@@ -11,7 +13,8 @@
 
 import type { Context, Hono } from "hono";
 import { cleanText } from "../search/params";
-import { ask, type AskRequestV4 } from "../search/ask";
+import { ask, elaborate, type AskRequestV4 } from "../search/ask";
+import { isAnswerStyle, isLengthRequest } from "../search/compose";
 import { isModeRequest } from "../search/query-router";
 import { isReasoningLevel } from "../llm/provider";
 import { recordAnswerFeedback } from "../search/feedback";
@@ -19,6 +22,19 @@ import { BodyTooLarge, execOf, isAdmin, MAX_IMAGE_UPLOAD, MAX_SMALL_BODY, readBo
 import { ImageTooLarge, queryImageOf, readUploadedImage } from "./image";
 
 const truthy = (v: unknown) => v === true || (typeof v === "string" && /^(1|true|yes|on)$/i.test(v)) || v === 1;
+
+/** The long-form options of a request (/ask and /query): style, text, length, defer. */
+export function richOptions(get: (k: string) => unknown): Pick<AskRequestV4, "style" | "text" | "length" | "defer"> {
+  const style = get("style");
+  const text = get("text");
+  const length = get("length");
+  return {
+    style: isAnswerStyle(style) ? style : undefined,
+    text: text === "full" || text === "short" ? text : undefined,
+    length: isLengthRequest(length) ? length : undefined,
+    defer: truthy(get("defer")) || undefined,
+  };
+}
 
 /** The /ask request of a GET or POST, with what the caller may ask for. */
 function askRequest(c: Context<Bindings>, body: Record<string, unknown>, notes: string[]): AskRequestV4 | { error: string } {
@@ -51,6 +67,7 @@ function askRequest(c: Context<Bindings>, body: Record<string, unknown>, notes: 
     trace: truthy(get("trace")),
     graph: truthy(get("graph")),
     admin,
+    ...richOptions(get),
   };
 }
 
@@ -109,6 +126,17 @@ export function registerAsk(app: Hono<Bindings>): void {
     const res = await ask(c.env, { ...a, ...(image ? { image } : {}) }, execOf(c));
     if (notes.length) res.notes = [...new Set([...notes, ...res.notes])];
     return c.json(res);
+  });
+
+  /**
+   * The model's part of a rich answer asked with defer=1: {status: pending | ready | failed |
+   * unknown, answer: the fields it changed}. Runs the model the first time it is asked (so the
+   * caller waits here instead of on /ask); a failed call is tried again by the next GET.
+   */
+  app.get("/ask/elaboration/:qid", async (c) => {
+    const r = await elaborate(c.env, c.req.param("qid"));
+    c.header("cache-control", "no-store");
+    return c.json(r, r.status === "unknown" ? 404 : 200);
   });
 
   /** A vote on an answer: {"query_id": "…", "rating": 1 | -1, "reason"?}. */

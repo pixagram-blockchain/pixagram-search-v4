@@ -1,8 +1,8 @@
 {
   "name": "pixagram-search-v4",
-  "version": "4.0.0",
+  "version": "4.8.0",
   "private": true,
-  "description": "Search and answers for Pixagram on Cloudflare (Workers, D1, Queues, Vectorize, Workers AI, R2, Durable Objects, Workflows) with a Hugging Face SigLIP 2 endpoint: v3's deterministic search as the system of record, plus a v4 retrieval, verification and reasoning engine — query routing and decomposition, evidence cards and verification, model-agnostic reasoning with claim verification, image identity, and an evaluation and benchmark harness.",
+  "description": "Search and answers for Pixagram on Cloudflare (Workers, D1, Queues, Vectorize, Workers AI, R2, Durable Objects, Workflows) with a Hugging Face SigLIP 2 endpoint: v3's deterministic search as the system of record, plus a v4 retrieval, verification and reasoning engine — query routing and decomposition, evidence cards and verification, model-agnostic reasoning with claim verification, image identity, and an evaluation and benchmark harness; v4.8 adds the long-form answers: a deterministic digest, the model's body and reasoning trail verified sentence by sentence, follow-up questions, related searches, a text overview of searches, rich help, and deferred elaboration for the search box.",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

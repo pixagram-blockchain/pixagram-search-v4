@@ -28,7 +28,7 @@ import { computeFeatures } from "./features";
 import { dhash, halves, phash, phashBands } from "./phash";
 import { factorFor, upscale, upscaleNearest, type Scaler } from "./upscale";
 import { EmbedUnavailable, embedAndRemember, embedLabel, embeddingEnabled, mixVectors, parseViews, spaceSlots, type ViewName } from "./embed";
-import { describeImage, EmptyDescription, isVlmBackend } from "./describe";
+import { describeImage, EmptyDescription, isVlmBackend, vlmConfigError } from "./describe";
 import { extractArtworkConcepts } from "../concepts";
 import { paphPermanent, paphStage, paphVectorPass } from "../paph/copies";
 import { paphEnabled } from "../paph/shards";
@@ -327,7 +327,8 @@ async function imagePipeline(
   const embedOn = stages.has("embed") && embeddingEnabled(env) && !blocked.has("embed");
   const needEmbed = embedOn && (!!m.force || !art || art.embed_hash !== hash || staleModel || staleViews);
   const vlm = (env.VLM_BACKEND ?? "gemma").toLowerCase();
-  const describeOn = stages.has("describe") && isVlmBackend(vlm) && !blocked.has("describe");
+  const vlmError = isVlmBackend(vlm) ? vlmConfigError(env, vlm) : null;
+  const describeOn = stages.has("describe") && isVlmBackend(vlm) && !vlmError && !blocked.has("describe");
   // v2 marked descriptions done even when they came back empty: redo those.
   const describedOk = !!art && art.describe_hash === hash && (!!art.ai_caption || art.ai_status === "ok");
   const needDescribe = describeOn && (!!m.force || !describedOk);
@@ -336,7 +337,7 @@ async function imagePipeline(
   else if (stages.has("embed") && blocked.has("embed")) await setJob(env.DB, m.postId, "embed", "skipped", "ai-training=false blocks embeddings");
   else if (stages.has("embed") && !needEmbed) report.embed = "unchanged";
   if (stages.has("describe") && blocked.has("describe")) await setJob(env.DB, m.postId, "describe", "skipped", "ai-training=false blocks descriptions");
-  else if (stages.has("describe") && !describeOn) await setJob(env.DB, m.postId, "describe", "skipped", "VLM_BACKEND off");
+  else if (stages.has("describe") && !describeOn) await setJob(env.DB, m.postId, "describe", "skipped", vlmError ?? "VLM_BACKEND off");
   else if (stages.has("describe") && !needDescribe) report.describe = "unchanged";
   if (!needEmbed && !needDescribe) return { retry: paphRetry };
 

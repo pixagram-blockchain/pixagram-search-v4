@@ -50,6 +50,13 @@ export const PROFILES: Record<Mode, ExecutionProfile> = {
   expert: { mode: "expert", retrieval: "multi-stage", reranking: true, reasoning: "high", maxOutputTokens: 6000, strictClaims: true, cards: 24, llmDecomposition: true },
 };
 
+/**
+ * The visible reply of a rich answer (v4.8): the long-form reply (body, reasoning trail, claims,
+ * follow-ups) needs room — about 1,500 tokens for a 250-word body with its claims, 3,000 for 800
+ * words. v4's budgets above stay for the brief style.
+ */
+export const COMPOSE_TOKENS: Record<Mode, number> = { fast: 800, balanced: 3000, deep: 5000, expert: 8000 };
+
 export interface RouteSignalsV4 {
   words: number;
   entities: number;
@@ -235,9 +242,10 @@ export function modeForBand(band: ComplexityBand): Mode {
 /**
  * The mode of a question. `max`: the deepest this caller may have at all (an explicit request is
  * capped by it); `ceiling`: the deepest auto may pick by itself (the search box: an explicit
- * request is not capped by it).
+ * request is not capped by it); `floor`: the shallowest auto may pick (rich answers: balanced, so
+ * the model elaborates; an explicit request is not raised by it).
  */
-export function chooseMode(env: Env, requested: ModeRequest | undefined, route: QueryRoute, opts: { needsSynthesis: boolean; ceiling?: Mode; max?: Mode }): { mode: Mode; explicit: boolean } {
+export function chooseMode(env: Env, requested: ModeRequest | undefined, route: QueryRoute, opts: { needsSynthesis: boolean; ceiling?: Mode; max?: Mode; floor?: Mode }): { mode: Mode; explicit: boolean } {
   const max = opts.max ?? "expert";
   const ceiling = minMode(opts.ceiling ?? max, max);
   // the caller's choice is explicit (it may call the model where the index alone would answer);
@@ -248,5 +256,11 @@ export function chooseMode(env: Env, requested: ModeRequest | undefined, route: 
   if (!bool(env.SEARCH_AUTO_COMPLEXITY, true)) return { mode: minMode(asMode(env.SEARCH_DEFAULT_MODE, "balanced"), ceiling), explicit: false };
   let mode = modeForBand(route.band);
   if (opts.needsSynthesis) mode = maxMode(mode, "balanced");
+  if (opts.floor) mode = maxMode(mode, opts.floor);
   return { mode: minMode(mode, ceiling), explicit: false };
+}
+
+/** The shallowest mode rich answers run in by themselves (SEARCH_RICH_MIN_MODE, default balanced). */
+export function richMinMode(env: Env): Mode {
+  return asMode(String(env.SEARCH_RICH_MIN_MODE ?? "balanced").trim(), "balanced");
 }

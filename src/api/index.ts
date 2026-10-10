@@ -29,7 +29,8 @@ app.onError((err, c) => {
   return c.json({ error: err.message ?? "internal error" }, 500);
 });
 
-for (const path of ["/search", "/query", "/feedback", "/ask/feedback", "/similar/*", "/duplicates/*", "/posts/*", "/history/*", "/concepts", "/copies/*", "/paph/*"]) app.use(path, rateLimited("public"));
+// the elaboration of a deferred answer is on the public budget: its model call was paid for by the /ask that deferred it
+for (const path of ["/search", "/query", "/feedback", "/ask/feedback", "/ask/elaboration/*", "/similar/*", "/duplicates/*", "/posts/*", "/history/*", "/concepts", "/copies/*", "/paph/*"]) app.use(path, rateLimited("public"));
 // suggestions come with every pause in typing: a budget of their own, so typing never starves searching
 app.use("/suggest", rateLimited("suggest"));
 for (const path of ["/ask", "/help", "/search-by-image", "/copies-by-image"]) app.use(path, rateLimited("heavy"));

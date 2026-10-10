@@ -56,7 +56,9 @@ export interface Env {
   EMBED_PATCHES?: string;
   /** "on" (default) embeds title/caption/tags (artworks) and title/body (blogs) into VEC_TEXT. */
   TEXT_VECTORS?: string;
-  VLM_BACKEND?: "gemma" | "moondream" | "caption" | "scout" | "off" | string;
+  VLM_BACKEND?: "chat" | "gemma" | "moondream" | "caption" | "scout" | "off" | string;
+  /** The vision chat model of the "chat" backend (a model id the model table knows as vision-capable, e.g. @cf/zai-org/glm-5.3-flash). */
+  VLM_MODEL?: string;
   /** Long side of the image sent to the VLM (default 512). */
   VLM_TARGET?: string;
   SCALER?: "xbrz" | "nearest" | string;
@@ -87,7 +89,9 @@ export interface Env {
   DOCS_EMBED_MODEL?: string;
   /** Dimensions of DOCS_EMBED_MODEL = those of VEC_DOCS (checked on every embedding). */
   DOCS_EMBED_DIM?: string;
-  /** Cosine above which a documentation chunk counts as relevant (default 0.5, bge-m3). */
+  /** The retrieval task a question is embedded with on Qwen3-Embedding (docs/vectors.ts has the default). */
+  DOCS_QUERY_INSTRUCTION?: string;
+  /** Cosine above which a documentation chunk counts as relevant (default 0.5, read on bge-m3; re-read after a model change). */
   DOCS_MIN_SCORE?: string;
   /** Workers AI model that writes help answers from the documentation (JSON mode). */
   HELP_MODEL?: string;
@@ -168,6 +172,26 @@ export interface Env {
   SEARCH_TRACE_SAMPLE?: string;
   /** Seconds a reasoned /ask answer is cached (keyed on the evidence, the model and the prompt). */
   SEARCH_ANSWER_CACHE_TTL?: string;
+
+  // ---- v4.8: long-form answers (search/compose.ts, search/digest.ts, README "Rich answers") -------
+  /**
+   * rich (default): every answer carries a deterministic digest (facts, overview, caveats, follow-up
+   * questions, related searches), and in balanced and above the model writes a long body, a
+   * reasoning trail and its own follow-ups, verified sentence by sentence. brief: v4's answers.
+   */
+  SEARCH_ANSWER_STYLE?: string;
+  /** Body length targets per mode, in words: "balanced:250,deep:450,expert:800". */
+  SEARCH_ANSWER_WORDS?: string;
+  /** rich: the mode auto never picks below (default balanced), so questions from the search box reach the model. */
+  SEARCH_RICH_MIN_MODE?: string;
+  /** Follow-up questions shown with an answer, at most (default 6). */
+  SEARCH_FOLLOW_UPS?: string;
+  /** Seconds a deferred elaboration's frozen context and its result are kept (default 1800). */
+  SEARCH_ELABORATION_TTL?: string;
+  /** rich (default): /help answers at length, with follow-up questions and related sections; brief: v4's. */
+  HELP_STYLE?: string;
+  /** /help body length targets per mode, in words: "fast:120,balanced:200,deep:350,expert:600". */
+  HELP_ANSWER_WORDS?: string;
 
   // ---- copy detection (src/paph, README-V4 "Copy detection") -------------------------------------
   /** "false" turns the paph stage and the /copies routes off while keeping the binding. Default true. */

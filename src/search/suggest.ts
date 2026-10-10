@@ -35,7 +35,7 @@ import { suggest as spellSuggest } from "./spell";
 import { DOCS_KNOWS, QUESTION_START, routeQuery } from "./router";
 import { planQuery } from "./planner";
 
-export type SuggestionKind = "complete" | "question" | "title" | "help" | "popular" | "correction";
+export type SuggestionKind = "complete" | "question" | "title" | "help" | "popular" | "correction" | "followup";
 
 export interface Suggestion {
   /** what the row shows, and what goes into the box when it is picked */
@@ -715,6 +715,34 @@ async function popular(env: Env, raw: string, limit: number): Promise<Array<{ q:
 }
 
 // ---- suggestions for typed text --------------------------------------------------------------------
+
+// ---- after an answer (v4.8) -----------------------------------------------------------------------------------
+
+/** What an answer left for the box: its follow-up questions and related searches (search/ask.ts keeps them for SEARCH_ELABORATION_TTL). */
+export interface AnswerSuggestions {
+  follow_ups: Array<{ text: string; route: "ask" | "search" | "help" }>;
+  searches: Array<{ text: string; route: "search" }>;
+}
+
+export const answerSuggestionsKey = (qid: string) => `sugg:${qid}`;
+
+/**
+ * The suggestions an answer left, as the box shows them: with nothing typed, the follow-ups then
+ * the searches; while typing, the ones that contain the typed words. Nothing for an id the index
+ * does not know (expired, or made up).
+ */
+export async function suggestAfter(env: Env, qid: string, text: string, limit: number): Promise<Suggestion[]> {
+  if (!/^[A-Za-z0-9_-]{6,64}$/.test(qid)) return [];
+  const kept = (await env.CACHE.get(answerSuggestionsKey(qid), "json").catch(() => null)) as AnswerSuggestions | null;
+  if (!kept || !Array.isArray(kept.follow_ups)) return [];
+  const typed = norm(text).trim();
+  const words = typed.split(" ").filter(Boolean);
+  const matches = (t: string) => !words.length || words.every((w) => norm(t).includes(w));
+  const out: Suggestion[] = [];
+  for (const f of kept.follow_ups) if (matches(f.text)) out.push({ text: f.text, kind: "followup", route: f.route });
+  for (const x of kept.searches ?? []) if (matches(x.text) && !out.some((o) => norm(o.text) === norm(x.text))) out.push({ text: x.text, kind: "followup", route: "search" });
+  return out.slice(0, limit);
+}
 
 export async function suggestFor(env: Env, text: string, opts: { lang?: string | null; limit?: number } = {}): Promise<SuggestResponse> {
   const t0 = Date.now();
