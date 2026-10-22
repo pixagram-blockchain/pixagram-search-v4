@@ -71,6 +71,8 @@ export interface Env {
   MARKET_CUSTOM_JSON_IDS?: string;
   TAIL_BLOCKS_PER_TICK?: string;
   TAIL_IDLE_SECONDS?: string;
+  /** failed ticks in a row on the same post before the tail sets that post aside (default 6, about a minute) */
+  TAIL_PARK_AFTER?: string;
   /** Walk each account's comment history during the backfill (post_versions). Default "true". */
   HISTORY_BACKFILL?: string;
   /** Max account_history calls per account in one backfill step (each scans ≤ 2000 ops). Default 300. */

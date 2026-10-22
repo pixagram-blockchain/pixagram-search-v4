@@ -53,6 +53,13 @@ export default {
       } catch (e) {
         console.error("watchdog failed", e);
       }
+      // Posts the tail set aside because their ingestion kept failing: tried again.
+      try {
+        const r = await indexerStub(env).retryParked();
+        if (r.retried) console.log("indexer parked retry", JSON.stringify(r));
+      } catch (e) {
+        console.error("parked retry failed", e);
+      }
       return;
     }
     // Nightly: counters of posts inside their payout window, background samples, log retention.

@@ -228,7 +228,7 @@ v3's variables keep their meaning:
 | `DOCS_REPO`, `DOCS_BRANCH`, `DOCS_PATHS` | `pixagram-blockchain/information`, `main`, (all) | the repository behind `/help`; `off` disables help |
 | `DOCS_EMBED_MODEL`, `DOCS_EMBED_DIM`, `DOCS_MIN_SCORE`, `DOCS_QUERY_INSTRUCTION` | `@cf/qwen/qwen3-embedding-0.6b`, 1024, 0.4, (built in) | documentation vectors and relevance (v4.8.1: Qwen3-Embedding, questions embedded with the retrieval instruction; README-V4 "Models, October 2026" on re-embedding and the threshold) |
 | `SUGGEST_POPULAR` | `off` | popular searches in `/suggest` (see README-V3) |
-| `MARKET_CUSTOM_JSON_IDS`, `TAIL_BLOCKS_PER_TICK`, `TAIL_IDLE_SECONDS` | —, 100, 3 | marketplace hook, tail pacing |
+| `MARKET_CUSTOM_JSON_IDS`, `TAIL_BLOCKS_PER_TICK`, `TAIL_IDLE_SECONDS`, `TAIL_PARK_AFTER` | —, 100, 3, 6 | marketplace hook, tail pacing; failed ticks in a row on one post before the tail sets that post aside |
 | `ADMIN_TOKEN`, `GITHUB_WEBHOOK_SECRET` (secrets) | — | `/admin/*` bearer token; the documentation push webhook |
 
 v4's (spec §57-58; every model is configuration):
@@ -579,3 +579,13 @@ checks to end by then (README-V4 "Copy detection").
 - `xbrz-js` is a GPL-3 port of Zenju's xBRZ. It runs server-side only.
 - SVG artworks are indexed as posts but skipped by the image pipeline.
 - The Hivemind endpoints cap page size at 20, hence the account-by-account backfill.
+- The tail asks `get_content` for every post a block mentions. Hivemind answers a deleted post
+  (or one never created) with an assert, `"Post a/p was deleted 1 time(s)"`, where legacy nodes
+  answered an empty object; both mean "gone" (`getContent` returns null and the post is marked
+  deleted). Until that was handled, one deleted reply (13 Oct 2026, block 1130742) stopped the
+  tail for nine days: every later post was unknown, and the originality drawer said "Not checked
+  yet" on all of them. Now a post whose ingestion keeps failing is parked after
+  `TAIL_PARK_AFTER` failed ticks (about a minute), the tail moves on, and the ten-minute cron
+  tries parked posts again. `scripts/admin.sh indexer` shows `cursor`, `lib`, `lastError`,
+  `stuck` (the post failed ticks stopped on) and `parked`; a `cursor` far below `lib` with a
+  `lastError` is a stalled tail.

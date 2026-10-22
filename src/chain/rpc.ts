@@ -15,9 +15,22 @@ export class RpcError extends Error {
     public readonly code?: number,
     public readonly data?: unknown,
   ) {
-    super(message);
+    // Hivemind puts the actual reason in `data` behind a generic message ("Invalid parameters"):
+    // keep it in the message, which is what logs and the indexer's lastError show.
+    super(typeof data === "string" && data && !message.includes(data) ? `${message}: ${data}` : message);
     this.name = "RpcError";
   }
+}
+
+/**
+ * The node's refusal to return a post it does not hold. Hivemind asserts instead of answering an
+ * empty object: "Post a/p was deleted 1 time(s)" (code -31999, the reason in `data`) for a deleted
+ * post, "Assert Exception:Post a/p does not exist" (code -32602) for one never created.
+ */
+export function isMissingPost(e: unknown, author: string, permlink: string): boolean {
+  if (!(e instanceof RpcError)) return false;
+  const text = `${e.message} ${typeof e.data === "string" ? e.data : JSON.stringify(e.data ?? "")}`;
+  return text.includes(`Post ${author}/${permlink} `) && /\b(?:was deleted|does not exist)\b/i.test(text);
 }
 
 export class ChainRpc {
@@ -84,10 +97,20 @@ export class ChainRpc {
     return r.blocks ?? [];
   }
 
-  /** Full current state of a post (json_metadata is a string here). */
+  /**
+   * Full current state of a post (json_metadata is a string here); null when the chain no longer
+   * holds it (deleted) or never did. Legacy condenser nodes answer an empty object for those,
+   * Hivemind asserts (see isMissingPost): both are an answer about the post, not a failure.
+   */
   async getContent(author: string, permlink: string): Promise<CondenserPost | null> {
-    const r = await this.call<CondenserPost>("condenser_api.get_content", [author, permlink]);
-    if (!r || !r.author) return null; // Hive returns an empty object for unknown posts
+    let r: CondenserPost;
+    try {
+      r = await this.call<CondenserPost>("condenser_api.get_content", [author, permlink]);
+    } catch (e) {
+      if (isMissingPost(e, author, permlink)) return null;
+      throw e;
+    }
+    if (!r || !r.author) return null;
     return r;
   }
 
