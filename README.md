@@ -126,7 +126,7 @@ src/evaluation/               retrieval.ts, answer.ts (scoring, reliability), mo
 src/search/{planner,lexicon,sql,service,ranker,spell,background,vectors,visual,router,suggest,feedback}.ts   v3 search (kept)
 src/chain/, src/db/, src/concepts/, src/enrich/, src/docs/   v3: chain, storage, concepts, enrichment, documentation sync
 hf/                           the Space (unchanged from v3)
-scripts/deploy.sh, teardown.sh, lib.sh, create-resources.sh, admin.sh
+scripts/deploy.sh, deploy-worker.sh, teardown.sh, lib.sh, create-resources.sh, admin.sh
 scripts/eval.py               v3's live evaluation (search, two stacks side by side, /ask)
 scripts/eval_v4.py            v4's question set against a deployed stack
 scripts/benchmark.py          reasoning models on frozen contexts (spec §31)
@@ -160,6 +160,12 @@ tail, syncs the documentation, waits for enrichment, then compares v3 and v4 on 
 and runs the v4 question set in the deterministic mode. It is safe to re-run. `scripts/teardown.sh`
 removes the stack. The R2 bucket `pixagram-art` is shared (content-addressed, written only when
 missing, never deleted).
+
+`wrangler.jsonc` in the repository keeps placeholders for the account's ids (`REPLACE_D1_ID`,
+`REPLACE_KV_ID`), so a plain `npx wrangler deploy` from a fresh checkout or archive fails on them.
+For a code-only update, `scripts/deploy-worker.sh` looks up the existing D1 database and KV
+namespace by name, writes their ids into `wrangler.jsonc`, applies pending migrations and deploys
+the Worker: no Space, secrets or backfill, and it never creates a resource.
 
 ### Tests and evaluation
 
