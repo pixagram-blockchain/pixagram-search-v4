@@ -6,6 +6,7 @@ colorTo: indigo
 sdk: gradio
 sdk_version: 6.28.0
 app_file: app.py
+suggested_hardware: cpu-upgrade
 pinned: false
 license: apache-2.0
 short_description: SigLIP image/text embeddings for the Pixagram search engine
@@ -30,12 +31,15 @@ corpus; older Spaces without the field still work (the Worker knows the SigLIP 2
 
 ## Deploy as a Space
 
-1. Create a Space (SDK: **Gradio**, hardware: **CPU basic** is enough — a SigLIP-base pass on
-   one artwork takes ~0.25 s on 2 vCPU, ~0.5 s for NaFlex at 576 patches). The Space computes
-   one embedding per CPU at once and queues the rest; the Worker reads that number from
-   `/health` (`concurrency`) every ten minutes and sends as many per consumer invocation, so
-   bigger hardware is used with nothing else to change: on CPU upgrade (8 vCPU) it computes 8
-   at once instead of 2.
+1. Create a Space (SDK: **Gradio**) on **CPU upgrade** (8 vCPU, 32 GB, $0.03 an hour) with the
+   sleep time set to **never**: what the v4 Space runs since v4.8.2. `scripts/space_hardware.py`
+   sets both, and `scripts/deploy-space.sh` and `scripts/deploy.sh` call it. CPU basic is enough
+   for the model (a SigLIP-base pass on one artwork takes ~0.25 s on 2 vCPU, ~0.5 s for NaFlex at
+   576 patches), but free hardware sleeps after 48 hours without a request (see Cold start below).
+   The Space computes one embedding per CPU at once and queues the rest; the Worker reads that
+   number from `/health` (`concurrency`) every ten minutes and sends as many per consumer
+   invocation, and its sweeper re-drives twelve artworks a run per embedding at once. So bigger
+   hardware is used with nothing else to change: on CPU upgrade it computes 8 at once instead of 2.
 2. Upload this folder — `README.md` (the frontmatter above is the Space config), `app.py`,
    `siglip.py`, `requirements.txt`; `handler.py` can stay, it is only used by Inference
    Endpoints. From the repository root:
@@ -46,8 +50,10 @@ corpus; older Spaces without the field still work (the Worker knows the SigLIP 2
    hf upload <owner>/<space> hf . --repo-type space
    ```
 
-   `scripts/deploy.sh` does all of this for the v4 Space (`primerz/pixagram-search-v4`); the v3
-   repository did it for `primerz/pixagram-search-v3`.
+   `scripts/deploy.sh` does all of this for the v4 Space (`primerz/pixagram-search-v4`), and
+   `scripts/deploy-space.sh` does it for the Space alone (hardware, sleep time, variables, files,
+   then waits until it serves the Worker's model); the v3 repository did it for
+   `primerz/pixagram-search-v3`.
 3. Visibility:
    * **Private** Space (recommended): every request must carry an HF token that can read the
      Space — set that token as the Worker's `HF_TOKEN` secret. Leave `API_TOKEN` unset.
@@ -61,10 +67,17 @@ corpus; older Spaces without the field still work (the Worker knows the SigLIP 2
 
 Cold start: the SigLIP base checkpoints are ~1.5 GB; the Space answers `/health`
 in seconds and `/embed` blocks until the weights are loaded (about 20 s once cached, a few
-minutes on the first build). Free CPU Spaces **sleep after 48 h without traffic**; the Worker
-treats the wake-up page as a transient error and retries with backoff, and search simply runs
-without the semantic leg until the Space is back. If that gap matters, use paid CPU hardware
-and set the sleep time to "never".
+minutes on the first build).
+
+Sleep: free CPU Spaces **sleep after 48 h without traffic**, and the Worker's own requests did not
+wake the v4 Space: it stopped answering on 29 October 2026 and was found asleep on 3 November,
+when someone opened it. The artworks posted meanwhile got no image or text vectors, `/similar`
+returned nothing for them, and `/healthz` kept saying `semantic: true`. Hence paid hardware that
+never sleeps. Since v4.8.2 the Worker also copes with an outage of any length (README-V4
+"v4.8.2"): failures on the Space's side do not count toward the sweeper's give-up cap, the
+sweeper waits for `/health` to be ready and then re-drives everything the outage missed,
+`/healthz` says `degraded`, and `/similar` embeds an artwork without a vector on demand, or ranks
+by concepts and colours while the Space is down.
 
 ## Concurrency
 
@@ -89,7 +102,8 @@ vCPU) at the cost of throughput.
 
 `python3 hf/loadtest.py https://<owner>-<space>.hf.space <token>` measures a running Space the
 same way (the token is the Worker's `HF_TOKEN`, `SPACE_API_TOKEN` in `~/.pixagram-search-v4.json`):
-run it before and after changing the hardware.
+run it before and after changing the hardware. On CPU upgrade `/health` should report `cpus: 8`,
+`concurrency: 8` and `threads: 1`; the table above was measured on 2 vCPU, not yet on 8.
 
 ## Troubleshooting
 

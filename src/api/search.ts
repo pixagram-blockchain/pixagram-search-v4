@@ -19,7 +19,8 @@ import { getPostById, getArtwork } from "../db/posts";
 import { decodeImage, sniff } from "../enrich/decode";
 import { dhash, phash } from "../enrich/phash";
 import { embeddingEnabled } from "../enrich/embed";
-import { embedImageViews } from "../enrich/consumer";
+import { embedImageViews } from "../enrich/views";
+import { healthReport } from "../enrich/health";
 import { COLOR_NAMES, NAMED_COLORS } from "../enrich/color";
 import { SIZE_CLASSES } from "../enrich/stats";
 import { knownAuthors } from "../search/context";
@@ -71,9 +72,16 @@ export function queryMaxMode(env: Env, style: "rich" | "brief" = "brief"): Mode 
 export function registerSearch(app: Hono<Bindings>): void {
   app.get("/", (c) => c.json({ name: "pixagram-search", version: 4, endpoints: ENDPOINTS }));
 
+  /**
+   * ok: the Worker and D1 answer. status: "degraded" when the embedding Space is not ready or
+   * vectors have been missing for over an hour (problems says which); ?strict=1 answers 503 then,
+   * for an uptime monitor. embedding: the Space's /health (checked at most once a minute);
+   * vectors: the backlog.
+   */
   app.get("/healthz", async (c) => {
-    const row = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM posts WHERE deleted = 0").first<{ n: number }>();
-    return c.json({ ok: true, posts: row?.n ?? 0, semantic: embeddingEnabled(c.env), text_vectors: !!c.env.VEC_TEXT });
+    const r = await healthReport(c.env);
+    const strict = new URL(c.req.url).searchParams.get("strict") === "1";
+    return c.json(r, strict && r.status !== "ok" ? 503 : 200);
   });
 
   /** The filter vocabularies the UI needs to render controls. */
@@ -272,8 +280,10 @@ export function registerSearch(app: Hono<Bindings>): void {
     const sp = new URL(c.req.url).searchParams;
     const limit = Math.min(50, Math.max(1, int(sp.get("limit") ?? undefined, 24)));
     // Always filtered like /search: NSFW stays out unless nsfw=include|only is asked for.
-    const r = await similar(c.env, id, limit, parseSearchRequest(sp));
-    return c.json({ id, method: r.method, items: r.items });
+    // computing a missing vector on demand is charged to the heavy rate limit, like /search-by-image
+    const r = await similar(c.env, id, limit, parseSearchRequest(sp), { allowCompute: () => heavyAllowed(c) });
+    // method: hybrid (SigLIP vector, `vector` stored or computed now) | features (no vector) | none
+    return c.json({ id, method: r.method, vector: r.vector, ...(r.note ? { note: r.note } : {}), items: r.items });
   });
 
   app.get("/duplicates/:id", async (c) => {

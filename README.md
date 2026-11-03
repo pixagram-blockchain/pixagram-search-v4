@@ -8,7 +8,11 @@ answered — see [Rich answers](#rich-answers-v48) below. **v4.8.1** moves the m
 stronger ones Workers AI serves in October 2026 — GLM-5.3-Flash for reasoning and help, GLM-5.3
 for the deep band, Qwen3-Embedding for the documentation vectors — and gives the description
 stage a configurable chat model; README-V4 "Models, October 2026" says what changed and what to
-do after deploying it (re-embed the documentation, set `DOCS_MIN_SCORE`).
+do after deploying it (re-embed the documentation, set `DOCS_MIN_SCORE`). **v4.8.2** keeps the
+vectors complete through an embedding-Space outage, after one left 298 artworks without vectors
+and `/similar` empty for them: the Space runs on CPU upgrade without sleep, outages no longer use
+up a post's retries, `/healthz` reports the Space and the vector backlog, and `/similar` embeds an
+artwork on demand or falls back to concepts and colours (README-V4 "v4.8.2").
 
 v4 keeps v3's deterministic search as the system of record and builds a retrieval, verification
 and reasoning engine around it. The Pixagram index decides what happened; a language model may
@@ -125,8 +129,8 @@ src/evaluation/               retrieval.ts, answer.ts (scoring, reliability), mo
                               (frozen contexts, several models); datasets/questions.jsonl (1,608 questions)
 src/search/{planner,lexicon,sql,service,ranker,spell,background,vectors,visual,router,suggest,feedback}.ts   v3 search (kept)
 src/chain/, src/db/, src/concepts/, src/enrich/, src/docs/   v3: chain, storage, concepts, enrichment, documentation sync
-hf/                           the Space (unchanged from v3)
-scripts/deploy.sh, deploy-worker.sh, teardown.sh, lib.sh, create-resources.sh, admin.sh
+hf/                           the Space (as v3; v4.8.2: CPU upgrade, never sleeping)
+scripts/deploy.sh, deploy-worker.sh, deploy-space.sh, space_hardware.py, teardown.sh, lib.sh, create-resources.sh, admin.sh
 scripts/eval.py               v3's live evaluation (search, two stacks side by side, /ask)
 scripts/eval_v4.py            v4's question set against a deployed stack
 scripts/benchmark.py          reasoning models on frozen contexts (spec §31)
@@ -165,7 +169,10 @@ missing, never deleted).
 `REPLACE_KV_ID`), so a plain `npx wrangler deploy` from a fresh checkout or archive fails on them.
 For a code-only update, `scripts/deploy-worker.sh` looks up the existing D1 database and KV
 namespace by name, writes their ids into `wrangler.jsonc`, applies pending migrations and deploys
-the Worker: no Space, secrets or backfill, and it never creates a resource.
+the Worker: no Space, secrets or backfill, and it never creates a resource. `scripts/deploy-space.sh`
+is its counterpart for the Space: it puts the Space on CPU upgrade without sleep
+(`scripts/space_hardware.py`; `SPACE_HARDWARE=keep` leaves the hardware alone), sets its variables,
+uploads `hf/` and waits until it serves the Worker's model and patch budget.
 
 ### Tests and evaluation
 
@@ -518,8 +525,10 @@ nightly pass goes through every shard).
 
 | route | |
 |---|---|
-| `GET /similar/:id`, `GET /duplicates/:id`, `POST /search-by-image` | as v3 |
-| `GET /history/:id`, `GET /posts/:id`, `/posts/:author/:permlink`, `GET /concepts`, `/img/…`, `/vocab`, `/healthz` | as v3 |
+| `GET /similar/:id` | as v3, plus (v4.8.2) `vector`: `stored`, or `computed` when the artwork had no vector and was embedded for this request (charged to the heavy rate limit; cached a day; its embed stage is queued); `method`: `hybrid` (by the vector), `features` (no vector could be had: shared concepts, colours, shape and pHash, with `similarity.theme` in the semantic part's place, and a `note` saying why) or `none` |
+| `GET /duplicates/:id`, `POST /search-by-image` | as v3 |
+| `GET /healthz` | `ok` (the Worker and D1 answer), and since v4.8.2 `status` (`ok` or `degraded`), `problems`, `semantic` (the Space is ready now), `embedding` (the Space's `/health`: model, CPUs, concurrency; checked at most once a minute) and `vectors` (artworks and posts without a current vector, those missing for over an hour, jobs given up). `?strict=1` answers 503 when degraded, for an uptime monitor |
+| `GET /history/:id`, `GET /posts/:id`, `/posts/:author/:permlink`, `GET /concepts`, `/img/…`, `/vocab` | as v3 |
 | `POST /feedback` | search engagement events (v3) |
 | `POST /ask/feedback` | `{query_id, rating: 1 \| -1, reason?: wrong \| unsupported \| incomplete \| other}`, for a recent answer |
 | `GET /ask/elaboration/:query_id` | v4.8: the model's part of an answer asked with `defer=1` ("Rich answers") |
@@ -577,8 +586,9 @@ checks to end by then (README-V4 "Copy detection").
   documentation answers; the documentation vectors (Qwen3-Embedding-0.6B, $0.0118) once per
   chunk and per new question; the cross-encoder ($0.003 per million tokens) on /ask's evidence
   in the deeper modes and on `/search?rerank=1`.
-- **HF Space:** free on CPU basic (sleeps after 48 h idle); paid CPU without sleep costs a few
-  dollars a month.
+- **HF Space:** CPU upgrade (8 vCPU, 32 GB) without sleep, $0.03 an hour, about $22 a month
+  (v4.8.2). Free CPU basic sleeps after 48 h without traffic, which is how the v4 Space stopped
+  answering from 29 October to 3 November 2026.
 
 ## Notes
 

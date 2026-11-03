@@ -26,12 +26,16 @@ import { decodeImage, encodePng, sniff, type ContainerInfo, type RgbaImage } fro
 import { computeStats } from "./stats";
 import { computeFeatures } from "./features";
 import { dhash, halves, phash, phashBands } from "./phash";
-import { factorFor, upscale, upscaleNearest, type Scaler } from "./upscale";
-import { EmbedUnavailable, embedAndRemember, embedLabel, embeddingEnabled, mixVectors, parseViews, spaceSlots, type ViewName } from "./embed";
+import { factorFor, upscale, type Scaler } from "./upscale";
+import { EmbedUnavailable, embedAndRemember, embedLabel, embeddingEnabled, endpointFault, spaceSlots } from "./embed";
+import { cachedImageVector, embedImageViews } from "./views";
 import { describeImage, EmptyDescription, isVlmBackend, vlmConfigError } from "./describe";
 import { extractArtworkConcepts } from "../concepts";
 import { paphPermanent, paphStage, paphVectorPass } from "../paph/copies";
 import { paphEnabled } from "../paph/shards";
+
+// The views and the image vector moved to views.ts (v4.8.2); still exported from here for existing imports.
+export { embedImageViews, viewPng } from "./views";
 
 type StageResult = "done" | "skipped" | "failed" | "unchanged" | "retry";
 
@@ -364,7 +368,10 @@ async function imagePipeline(
   // ---- embed -------------------------------------------------------------------------------------
   if (needEmbed) {
     try {
-      const r = await embedImageViews(env, im, preview);
+      // the vector /similar computed for this image a moment ago, when there is one (on-demand.ts):
+      // the same bytes, model, views and patch budget, so not asked of the Space again
+      const cached = m.force ? null : await cachedImageVector(env, hash);
+      const r = cached ? { vector: cached, model: env.EMBED_MODEL ?? "unknown", label: embedLabel(env) } : await embedImageViews(env, im, preview);
       freshVector = r.vector;
       await env.VEC.upsert([{ id: vectorId(m.postId), values: r.vector, metadata: vectorMetadata(post, art, hash) }]);
       await env.DB.prepare("UPDATE artworks SET embed_hash = ?, embed_model = ?, embed_views = ?, updated = ? WHERE post_id = ?").bind(hash, r.model, r.label, now(), m.postId).run();
@@ -376,7 +383,9 @@ async function imagePipeline(
         if (a?.paph_hash === hash) await paphVectorPass(env, m.postId, hash, r.vector, o).catch((e) => console.warn("paph vector pass failed", m.postId, errMsg(e)));
       }
     } catch (e) {
-      await setJob(env.DB, m.postId, "embed", "failed", errMsg(e));
+      // the Space asleep, down or misconfigured is not this artwork's failure: not counted toward
+      // the sweeper's give-up cap (src/db/posts.ts)
+      await setJob(env.DB, m.postId, "embed", "failed", errMsg(e), { count: !endpointFault(e) });
       if (e instanceof EmbedUnavailable && e.retryable) {
         report.embed = "retry";
         retry = new Retry(`embedding endpoint unavailable: ${e.message}`, 60);
@@ -479,30 +488,6 @@ async function runPaph(env: Env, m: EnrichMessage, art: ArtworkRow, hash: string
   }
 }
 
-/**
- * The PNG SigLIP sees for one view. Shared by the embed stage and /search-by-image so a query
- * image goes through exactly the same pipeline as the indexed artworks. `preview` is the cached
- * R2 preview (xBRZ at UPSCALE_TARGET when SCALER is xbrz), reused instead of upscaling twice.
- */
-export async function viewPng(view: ViewName, im: RgbaImage, env: Pick<Env, "SCALER" | "UPSCALE_TARGET">, preview?: () => Promise<Uint8Array>): Promise<Uint8Array> {
-  if (view === "xbrz") {
-    if (preview && (env.SCALER ?? "xbrz") !== "nearest") return preview();
-    return encodePng(upscale(im, factorFor(im.width, im.height, int(env.UPSCALE_TARGET, 800)), "xbrz"));
-  }
-  if (view === "nearest") return encodePng(upscaleNearest(im, factorFor(im.width, im.height, 512)));
-  return encodePng(im);
-}
-
-/** SigLIP image vector of a decoded image per EMBED_VIEWS (one view, or the weighted mix of several). */
-export async function embedImageViews(env: Env, im: RgbaImage, preview?: () => Promise<Uint8Array>): Promise<{ vector: number[]; model: string; label: string }> {
-  const views = parseViews(env.EMBED_VIEWS);
-  const images: string[] = [];
-  for (const v of views) images.push(base64Encode(await viewPng(v.view, im, env, preview)));
-  const r = await embedAndRemember(env, "images", images);
-  const vector = r.embeddings.length === 1 ? r.embeddings[0] : mixVectors(r.embeddings, views.map((v) => v.weight));
-  return { vector, model: r.model, label: embedLabel(env) };
-}
-
 // ---- concepts --------------------------------------------------------------------------------------
 
 function conceptInputs(post: PostRow, art: ArtworkRow | null) {
@@ -582,7 +567,7 @@ async function textStage(env: Env, post: PostRow, art: ArtworkRow | null, force:
     await setJob(env.DB, post.id, "text", "done");
     return "done";
   } catch (e) {
-    await setJob(env.DB, post.id, "text", "failed", errMsg(e));
+    await setJob(env.DB, post.id, "text", "failed", errMsg(e), { count: !endpointFault(e) });
     if (e instanceof EmbedUnavailable && e.retryable) throw new Retry(`embedding endpoint unavailable: ${e.message}`, 60);
     return "failed";
   }

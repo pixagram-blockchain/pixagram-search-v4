@@ -1,0 +1,14 @@
+-- v4.8.2: a Space outage no longer counts toward the sweeper's give-up cap.
+--
+-- The v4 embedding Space (primerz/pixagram-search-v4, free CPU) stopped answering on 29 October
+-- 2026 and was found asleep on 3 November. The embed and text jobs of the artworks posted meanwhile
+-- failed; each failure counted as an attempt, and after 40 the sweeper stopped re-driving them, so
+-- the 298 artworks posted between ids 813 and 1143 kept no image or text vector after the Space
+-- woke up: /similar returned nothing for them and semantic search could not find them.
+--
+-- From this release, failures on the endpoint's side (asleep, unreachable, 5xx, a wrong token or
+-- model) are recorded without counting (src/db/posts.ts, src/enrich/embed.ts). Jobs that failed
+-- before cannot tell which kind they were, so the embed and text jobs that are failed now start
+-- again from zero: the sweeper re-drives them, and a post that really cannot be embedded reaches
+-- the cap again on its own failures.
+UPDATE jobs SET attempts = 0 WHERE stage IN ('embed', 'text') AND status = 'failed' AND attempts > 0;

@@ -9,7 +9,7 @@
 // which the ranker and /ask use instead of raw cosines whose scale means nothing on its own.
 
 import type { Env } from "../env";
-import { int } from "../env";
+import { int, now } from "../env";
 
 export interface Calibration {
   logit_scale: number; // exp(logit_scale) of the model, ~110 for SigLIP base
@@ -23,11 +23,25 @@ export interface EmbedResult {
   calibration: Calibration | null;
 }
 
+/**
+ * Who a failed call says something about. "input": the endpoint read the request and refused this
+ * image or text (HTTP 400, 413, 422): trying the same post again is likely to fail again. "endpoint":
+ * everything else (asleep, starting, unreachable, overloaded, a 5xx, a wrong token, another model or
+ * patch budget): the post is fine and will embed once the endpoint is. The jobs table counts only the
+ * first kind toward the sweeper's give-up cap (src/db/posts.ts).
+ */
+export type EmbedBlame = "endpoint" | "input";
+
 export class EmbedUnavailable extends Error {
-  constructor(msg: string, public readonly retryable: boolean) {
+  constructor(msg: string, public readonly retryable: boolean, public readonly blame: EmbedBlame = "endpoint") {
     super(msg);
     this.name = "EmbedUnavailable";
   }
+}
+
+/** True when an error says the embedding endpoint was the problem, not the post (see EmbedBlame). */
+export function endpointFault(e: unknown): boolean {
+  return e instanceof EmbedUnavailable && e.blame === "endpoint";
 }
 
 /** Measured with hf/siglip.py (transformers 5, Oct 2026): model.logit_scale.exp(), model.logit_bias. */
@@ -69,6 +83,151 @@ export async function spaceSlots(env: Env): Promise<number> {
   return n;
 }
 
+// ---- the Space's state -----------------------------------------------------------------------------
+
+/** What the embedding endpoint's /health says, checked against this Worker's configuration. */
+export interface SpaceStatus {
+  /** HF_EMBED_URL is set */
+  configured: boolean;
+  /** /health answered with JSON */
+  reachable: boolean;
+  /** reachable, its weights loaded, and serving the model, dimension and patch budget the indexes hold */
+  ready: boolean;
+  model: string | null;
+  dim: number | null;
+  max_num_patches: number | null;
+  /** embeddings computed at once, PyTorch threads per embedding and the CPUs it may use (hf/siglip.py) */
+  concurrency: number | null;
+  threads: number | null;
+  cpus: number | null;
+  uptime_s: number | null;
+  /** why it is not ready; null when it is */
+  problem: string | null;
+  /** when it was checked (unix seconds), and how long /health took */
+  checked_at: number;
+  ms: number | null;
+}
+
+const STATUS = new WeakMap<object, SpaceStatus>();
+const STATUS_KEY = "space:status";
+/** One check stands for a minute (KV keeps a key at least 60 s). */
+const STATUS_TTL_S = 60;
+
+function healthUrl(env: Env): string {
+  return (env.HF_EMBED_URL ?? "").replace(/\/embed\/?$/, "") + "/health";
+}
+
+function blankStatus(env: Env): SpaceStatus {
+  return {
+    configured: !!env.HF_EMBED_URL, reachable: false, ready: false, model: null, dim: null, max_num_patches: null,
+    concurrency: null, threads: null, cpus: null, uptime_s: null, problem: env.HF_EMBED_URL ? null : "HF_EMBED_URL not configured", checked_at: now(), ms: null,
+  };
+}
+
+/** How long a /health check may take. */
+const PROBE_TIMEOUT_MS = 5_000;
+
+/** The last check if it is less than `maxAgeS` old (this isolate, then KV); null otherwise. Never asks the Space. */
+export async function cachedSpaceStatus(env: Env, maxAgeS = STATUS_TTL_S): Promise<SpaceStatus | null> {
+  if (!env.HF_EMBED_URL) return blankStatus(env);
+  const t = now();
+  const hit = STATUS.get(env.DB);
+  if (hit && t - hit.checked_at < maxAgeS) return hit;
+  if (maxAgeS <= 0) return null;
+  const kv = (await env.CACHE.get(STATUS_KEY, "json").catch(() => null)) as SpaceStatus | null;
+  if (kv && typeof kv.checked_at === "number" && t - kv.checked_at < maxAgeS) {
+    STATUS.set(env.DB, kv);
+    return kv;
+  }
+  return null;
+}
+
+/**
+ * The Space's state from its /health, checked at most once a minute per isolate and shared through
+ * KV, so a monitor polling /healthz or a burst of requests costs the Space one request a minute.
+ * A Space that is asleep, building or restarting answers with an HTML page or not at all: not
+ * reachable. `maxAgeS: 0` checks now. Only these full checks are shared; a failed call noted by
+ * noteEndpointFault stays in its isolate.
+ */
+export async function spaceStatus(env: Env, o: { maxAgeS?: number } = {}): Promise<SpaceStatus> {
+  const cached = await cachedSpaceStatus(env, o.maxAgeS ?? STATUS_TTL_S);
+  if (cached) return cached;
+  const s = await probeSpace(env, PROBE_TIMEOUT_MS);
+  STATUS.set(env.DB, s);
+  await env.CACHE.put(STATUS_KEY, JSON.stringify(s), { expirationTtl: STATUS_TTL_S }).catch(() => {});
+  return s;
+}
+
+async function probeSpace(env: Env, timeoutMs: number): Promise<SpaceStatus> {
+  const s = blankStatus(env);
+  const started = Date.now();
+  // hf/app.py on a Space always serves /health as JSON: anything else there means the Space is not
+  // serving it (asleep, building, private without a valid token, deleted). Elsewhere (an Inference
+  // Endpoint running hf/handler.py) /health may be missing or plain text: nothing to check, the
+  // calls will tell, and /healthz's backlog check still catches vectors that do not arrive.
+  let ours = true;
+  try {
+    ours = /\.hf\.space$/i.test(new URL(healthUrl(env)).hostname);
+  } catch {
+    // not a URL: the fetch below says so
+  }
+  let h: Record<string, unknown>;
+  try {
+    const headers: Record<string, string> = { accept: "application/json" };
+    if (env.HF_TOKEN) headers.authorization = `Bearer ${env.HF_TOKEN}`;
+    const res = await fetch(healthUrl(env), { headers, signal: AbortSignal.timeout(timeoutMs) });
+    const text = await res.text();
+    s.ms = Date.now() - started;
+    if (!res.ok) {
+      if (!ours && (res.status === 404 || res.status === 405)) return { ...s, reachable: true, ready: true };
+      return { ...s, problem: ours && res.status === 404 ? "/health HTTP 404 (a private Space without a valid token, or no such Space)" : `/health HTTP ${res.status}` };
+    }
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // not JSON: handled below, like JSON that is not an object
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      if (!ours) return { ...s, reachable: true, ready: true };
+      return { ...s, problem: "/health answered with a page, not JSON (asleep, building or restarting)" };
+    }
+    h = parsed as Record<string, unknown>;
+  } catch (e) {
+    const name = (e as { name?: string })?.name;
+    s.ms = Date.now() - started;
+    s.problem = name === "TimeoutError" || name === "AbortError" ? `/health timed out after ${timeoutMs / 1000} s` : `unreachable: ${e instanceof Error ? e.message : String(e)}`;
+    return s;
+  }
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  Object.assign(s, {
+    reachable: true, model: typeof h.model === "string" ? h.model : null, dim: num(h.dim), max_num_patches: num(h.max_num_patches),
+    concurrency: num(h.concurrency), threads: num(h.threads), cpus: num(h.cpus), uptime_s: num(h.uptime_s),
+  });
+  // the same checks as every /embed reply (call() below): vectors of another model, dimension or
+  // patch budget would not belong in the indexes
+  const dim = int(env.EMBED_DIM, 768);
+  const patches = int(env.EMBED_PATCHES, 0);
+  if (h.ok === false) s.problem = "/health says ok: false";
+  else if (h.ready === false) s.problem = "loading the model";
+  else if (env.EMBED_MODEL && s.model && s.model !== "stub" && s.model !== env.EMBED_MODEL) s.problem = `serves ${s.model} but EMBED_MODEL is ${env.EMBED_MODEL}`;
+  else if (s.dim && s.dim !== dim) s.problem = `dimension ${s.dim} but EMBED_DIM is ${dim}`;
+  else if (patches > 0 && s.max_num_patches !== null && s.max_num_patches !== patches) s.problem = `${s.max_num_patches} patches per image but EMBED_PATCHES is ${patches}`;
+  s.ready = s.problem === null;
+  return s;
+}
+
+/**
+ * A call just failed on the endpoint's side (endpointFault): until the next check, this isolate
+ * treats the Space as not ready, so the requests behind it fall back at once instead of each
+ * waiting for the same timeout.
+ */
+export function noteEndpointFault(env: Env, e: unknown): void {
+  if (!endpointFault(e) || !env.HF_EMBED_URL) return;
+  const prev = STATUS.get(env.DB) ?? blankStatus(env);
+  STATUS.set(env.DB, { ...prev, ready: false, problem: (e as Error).message, checked_at: now() });
+}
+
 /** Query texts wait at most this long (a hung Space must not stall /search); images, for indexing, longer. */
 const TEXT_TIMEOUT_MS = 10_000;
 const IMAGE_TIMEOUT_MS = 120_000;
@@ -93,7 +252,12 @@ async function call(env: Env, inputs: Record<string, unknown>, timeoutMs: number
   if (res.status === 503 || res.status === 502 || res.status === 429) {
     throw new EmbedUnavailable(`embedding endpoint ${res.status}`, true);
   }
-  if (!res.ok) throw new EmbedUnavailable(`embedding endpoint HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`, res.status >= 500);
+  if (!res.ok) {
+    // 400 / 413 / 422: hf/app.py read the request and refused this input (a bad image, too many
+    // items). Anything else (401 wrong token, 404 wrong URL, 5xx) is the endpoint's.
+    const input = res.status === 400 || res.status === 413 || res.status === 422;
+    throw new EmbedUnavailable(`embedding endpoint HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`, res.status >= 500, input ? "input" : "endpoint");
+  }
   // A Space that is sleeping, building or restarting answers with an HTML page: treat as transient.
   const text = await res.text();
   let json: any;
@@ -126,9 +290,12 @@ async function call(env: Env, inputs: Record<string, unknown>, timeoutMs: number
   return { model: json?.model ?? env.EMBED_MODEL ?? "unknown", dim: embeddings[0].length, embeddings, calibration };
 }
 
-/** Embed PNG/WebP images given as base64 strings (no data: prefix needed). */
-export function embedImages(env: Env, imagesBase64: string[]): Promise<EmbedResult> {
-  return call(env, { images: imagesBase64 }, IMAGE_TIMEOUT_MS);
+/**
+ * Embed PNG/WebP images given as base64 strings (no data: prefix needed). Indexing waits up to two
+ * minutes (a Space restarting after a deploy); a request path passes a shorter `timeoutMs`.
+ */
+export function embedImages(env: Env, imagesBase64: string[], timeoutMs = IMAGE_TIMEOUT_MS): Promise<EmbedResult> {
+  return call(env, { images: imagesBase64 }, timeoutMs);
 }
 
 export function embedTexts(env: Env, texts: string[]): Promise<EmbedResult> {
@@ -189,8 +356,8 @@ export async function embedQueriesCached(env: Env, texts: string[]): Promise<num
   return hits as number[][];
 }
 
-export async function embedAndRemember(env: Env, kind: "images" | "texts", inputs: string[]): Promise<EmbedResult> {
-  const r = kind === "images" ? await embedImages(env, inputs) : await embedTexts(env, inputs);
+export async function embedAndRemember(env: Env, kind: "images" | "texts", inputs: string[], timeoutMs?: number): Promise<EmbedResult> {
+  const r = kind === "images" ? await embedImages(env, inputs, timeoutMs) : await embedTexts(env, inputs);
   await rememberCalibration(env, r);
   return r;
 }

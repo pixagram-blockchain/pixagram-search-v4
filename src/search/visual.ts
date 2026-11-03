@@ -6,10 +6,14 @@
 //
 // /similar: hybrid score over the union of the SigLIP neighbours and the pHash neighbourhood:
 //   0.65 · semantic + 0.15 · pHash + 0.08 · dHash + 0.07 · colour + 0.05 · geometry
-// (weights renormalised when the artwork has no vector yet).
+// v4.8.2: an artwork without a stored vector (its embed stage has not succeeded yet) is embedded on
+// demand (src/enrich/on-demand.ts). When even that is impossible (the Space is down), the
+// neighbours come from shared concepts, colours, shape and pHash, the concepts standing in for
+// the semantic part ("features"), instead of an empty list.
 
 import type { Env } from "../env";
 import { bandProbes, hamming, MAX_INDEXED_RADIUS, sqlHamming } from "../enrich/phash";
+import { imageVectorNow } from "../enrich/on-demand";
 import { vectorId } from "../db/posts";
 import type { SearchRequest } from "./params";
 import { hydrateRows, rowToItem, runClause, type SearchItem } from "./service";
@@ -125,22 +129,30 @@ export function geometrySimilarity(a: { aspect: number | null; width: number | n
 export interface SimilarScore {
   visual: number;
   semantic: number | null;
+  /** shared concepts (0..1): the semantic part's stand-in when the artwork has no vector */
+  theme?: number;
   phash: number | null;
   dhash: number | null;
   color: number;
   geometry: number;
 }
 
-export function similarityScore(cos: number | null, me: any, other: any): SimilarScore {
+/**
+ * `cos`: SigLIP cosine with the artwork, null without a vector. `theme`: the share of the
+ * artwork's concepts the other one carries (conceptNeighbours), used in the semantic part's
+ * place when there is no cosine; null when the artwork has no concepts either.
+ */
+export function similarityScore(cos: number | null, me: any, other: any, theme: number | null = null): SimilarScore {
   const pd = me.phash && other.phash ? hamming(me.phash, other.phash) : null;
   const dd = me.dhash && other.dhash ? hamming(me.dhash, other.dhash) : null;
   const sem = cos === null ? null : imageSimilarity(cos);
+  const th = sem === null && theme !== null ? clamp01(theme) : null;
   const ph = pd === null ? null : clamp01(1 - pd / 32);
   const dh = dd === null ? null : clamp01(1 - dd / 32);
   const color = colorSimilarity(parse(me.buckets_json), parse(other.buckets_json));
   const geometry = geometrySimilarity(me, other);
   const parts: Array<[number, number | null]> = [
-    [SIMILAR_WEIGHTS.semantic, sem],
+    [SIMILAR_WEIGHTS.semantic, sem ?? th],
     [SIMILAR_WEIGHTS.phash, ph],
     [SIMILAR_WEIGHTS.dhash, dh],
     [SIMILAR_WEIGHTS.color, color],
@@ -148,7 +160,9 @@ export function similarityScore(cos: number | null, me: any, other: any): Simila
   ];
   const wsum = parts.reduce((s, [w, v]) => s + (v === null ? 0 : w), 0) || 1;
   const visual = parts.reduce((s, [w, v]) => s + (v === null ? 0 : w * v), 0) / wsum;
-  return { visual, semantic: sem, phash: ph, dhash: dh, color, geometry };
+  const out: SimilarScore = { visual, semantic: sem, phash: ph, dhash: dh, color, geometry };
+  if (th !== null) out.theme = th;
+  return out;
 }
 
 function parse(s: string | null): Array<{ name: string; weight: number }> {
@@ -160,28 +174,114 @@ function parse(s: string | null): Array<{ name: string; weight: number }> {
   }
 }
 
+/**
+ * Artworks about the same things as `postId`, by the concepts they share (artwork_concepts: tags,
+ * title, description and the AI description), each weighted by how rare it is (idf), so that a
+ * concept on nearly every artwork counts for little. Score 0..1: the share of the artwork's own
+ * concept weight the other one carries. The semantic part's stand-in when there is no vector.
+ * Scored in SQL over every artwork that shares a concept: nothing is cut before the weighting.
+ */
+export async function conceptNeighbours(env: Env, postId: number, limit: number): Promise<Map<number, number>> {
+  const mine =
+    (await env.DB.prepare("SELECT concept, confidence FROM artwork_concepts WHERE post_id = ? ORDER BY confidence DESC, concept LIMIT 60").bind(postId).all<{ concept: string; confidence: number }>()).results ?? [];
+  if (!mine.length) return new Map();
+  const [total, df] = await env.DB.batch<{ n: number; concept?: string }>([
+    env.DB.prepare("SELECT COUNT(*) AS n FROM posts WHERE deleted = 0 AND type = 'artwork'"),
+    env.DB.prepare(`SELECT concept, COUNT(*) AS n FROM artwork_concepts WHERE concept IN (${mine.map(() => "?").join(",")}) GROUP BY concept`).bind(...mine.map((m) => m.concept)),
+  ]);
+  const n = Math.max(1, Number(total.results?.[0]?.n ?? 1));
+  const dfOf = new Map((df.results ?? []).map((x) => [String(x.concept), Number(x.n)]));
+  const idf = (c: string) => Math.log(1 + n / Math.max(1, dfOf.get(c) ?? 1));
+  // the most telling concepts: rare and confident ones (3 values each: 24 stay under D1's 100)
+  const keep = mine.map((m) => ({ ...m, idf: idf(m.concept) })).sort((a, b) => b.idf * b.confidence - a.idf * a.confidence).slice(0, 24);
+  const norm = keep.reduce((s, m) => s + m.idf * m.confidence, 0) || 1;
+  const rows =
+    (
+      await env.DB
+        .prepare(
+          `WITH w(concept, conf, idf) AS (VALUES ${keep.map(() => "(?, ?, ?)").join(", ")})
+           SELECT c.post_id AS id, SUM(w.idf * MIN(w.conf, c.confidence)) AS s
+           FROM w JOIN artwork_concepts c ON c.concept = w.concept JOIN posts p ON p.id = c.post_id
+           WHERE p.deleted = 0 AND p.type = 'artwork' AND c.post_id != ?
+           GROUP BY c.post_id ORDER BY s DESC, c.post_id LIMIT ?`,
+        )
+        .bind(...keep.flatMap((k) => [k.concept, k.confidence, k.idf]), postId, limit)
+        .all<{ id: number; s: number }>()
+    ).results ?? [];
+  return new Map(rows.map((x) => [Number(x.id), Math.min(1, Number(x.s) / norm)] as [number, number]));
+}
+
+/** Artworks with the most colour in common with `postId` (histogram intersection of the named buckets). */
+async function colourNeighbours(env: Env, postId: number, limit: number): Promise<number[]> {
+  const rows =
+    (
+      await env.DB
+        .prepare(
+          `SELECT b.post_id AS id, SUM(MIN(a.weight, b.weight)) AS inter FROM artwork_colors a
+           JOIN artwork_colors b ON b.bucket = a.bucket AND b.post_id != a.post_id
+           JOIN posts p ON p.id = b.post_id
+           WHERE a.post_id = ? AND p.deleted = 0 AND p.type = 'artwork'
+           GROUP BY b.post_id ORDER BY inter DESC, b.post_id LIMIT ?`,
+        )
+        .bind(postId, limit)
+        .all<{ id: number }>()
+    ).results ?? [];
+  return rows.map((x) => Number(x.id));
+}
+
+/**
+ * How the neighbours were found. "hybrid": by the artwork's SigLIP vector (`vector` says whether
+ * it was the stored one or computed for this request), with pHash; "features": no vector could be
+ * had (the Space is down), so by shared concepts, colours, shape and pHash; "none": nothing found.
+ */
+export type SimilarMethod = "hybrid" | "features" | "none";
+
 export async function similar(
   env: Env,
   postId: number,
   limit: number,
   r: SearchRequest | null,
-): Promise<{ items: Array<SearchItem & { similarity?: SimilarScore }>; method: "hybrid" | "phash" | "none" }> {
+  o: { onDemand?: boolean; allowCompute?: () => Promise<boolean> } = {},
+): Promise<{ items: Array<SearchItem & { similarity?: SimilarScore }>; method: SimilarMethod; vector: "stored" | "computed" | "none"; note?: string }> {
   const meRows = await hydrateRows(env.DB, [postId], null);
   const me = meRows.get(postId);
-  if (!me || me.type !== "artwork") return { items: [], method: "none" };
-  const got = await env.VEC.getByIds([vectorId(postId)]).catch(() => []);
-  const vec = got[0]?.values ? Array.from(got[0].values as ArrayLike<number>) : null;
+  if (!me || me.type !== "artwork") return { items: [], method: "none", vector: "none" };
+  let indexDown: string | null = null;
+  let got: Awaited<ReturnType<VectorizeIndex["getByIds"]>> = [];
+  try {
+    got = await env.VEC.getByIds([vectorId(postId)]);
+  } catch (e) {
+    indexDown = e instanceof Error ? e.message : String(e);
+  }
+  let vec = got[0]?.values ? Array.from(got[0].values as ArrayLike<number>) : null;
+  let vector: "stored" | "computed" | "none" = vec ? "stored" : "none";
+  let note: string | undefined;
+  if (indexDown) {
+    // the vector index is failing: its neighbours could not be read either
+    note = `vector index unavailable: ${indexDown}`;
+  } else if (!vec && o.onDemand !== false) {
+    // `allowCompute`: the caller's rate limit, asked only when a vector is about to be computed
+    const fresh = await imageVectorNow(env, postId, { allow: o.allowCompute }).catch((e: unknown) => ({ vector: null, reason: e instanceof Error ? e.message : String(e) }) as const);
+    if (fresh.vector) (vec = fresh.vector), (vector = "computed");
+    else note = `no image vector: ${fresh.reason}`;
+  }
   const cos = new Map<number, number>();
   if (vec) for (const h of await knn(env, "image", vec, r, 100)) cos.set(h.id, h.score);
-  const near = me.phash ? (await phashNeighbours(env, me.phash, 12, 100, postId)).hits : [];
-  const ids = [...new Set([...cos.keys(), ...near.map((n) => n.id)])].filter((id) => id !== postId);
-  if (!ids.length) return { items: [], method: "none" };
+  // without a vector: the artworks about the same things, and those with the same colours
+  const [near, themes, colours] = await Promise.all([
+    me.phash ? phashNeighbours(env, me.phash, 12, 100, postId).then((x) => x.hits) : Promise.resolve([] as DuplicateHit[]),
+    vec ? Promise.resolve(new Map<number, number>()) : conceptNeighbours(env, postId, 100),
+    vec ? Promise.resolve([] as number[]) : colourNeighbours(env, postId, 50),
+  ]);
+  const ids = [...new Set([...cos.keys(), ...near.map((x) => x.id), ...themes.keys(), ...colours])].filter((id) => id !== postId);
+  const base = { vector, ...(note ? { note } : {}) };
+  if (!ids.length) return { items: [], method: "none", ...base };
   const rows = await hydrateRows(env.DB, ids, r);
   // A pHash neighbour outside the vector top-100 has a cosine at most the 100th one: use that floor.
   const floor = cos.size >= 100 ? Math.min(...cos.values()) : null;
   const scored = [...rows.values()]
     .filter((row) => row.type === "artwork")
-    .map((row) => ({ row, s: similarityScore(cos.get(row.id) ?? (vec ? floor : null), me, row) }))
+    .map((row) => ({ row, s: vec ? similarityScore(cos.get(row.id) ?? floor, me, row) : similarityScore(null, me, row, themes.size ? (themes.get(row.id) ?? 0) : null) }))
     .sort((a, b) => b.s.visual - a.s.visual || a.row.id - b.row.id)
     .slice(0, limit);
   const items = scored.map(({ row, s }) => {
@@ -190,5 +290,5 @@ export async function similar(
     it.similarity = Object.fromEntries(Object.entries(s).map(([k, v]) => [k, v === null ? null : Math.round((v as number) * 1000) / 1000])) as unknown as SimilarScore;
     return it;
   });
-  return { items, method: vec ? "hybrid" : "phash" };
+  return { items, method: vec ? "hybrid" : "features", ...base };
 }

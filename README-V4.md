@@ -774,3 +774,99 @@ spends and how long it takes on Workers AI, Qwen3-Embedding's `{queries, instruc
 through the binding and the cosines it gives on the documentation (hence step 3 above), and
 whether GLM-5.3-Flash describes pixel art better than Gemma 4 (hence step 6). The prices in
 the table are the model pages' of October 2026.
+
+## v4.8.2: the Space never sleeps (November 2026)
+
+The v4 embedding Space stopped answering, and for five days nothing noticed. v4.8.2 moves it to
+hardware that does not sleep and makes the Worker get through an outage of any length with
+every vector in place afterwards.
+
+### What happened
+
+- On 29 October 2026, between 02:29 and 03:04 UTC, the Space `primerz/pixagram-search-v4` (free
+  CPU basic, which sleeps after 48 hours without traffic) stopped answering. It was found asleep
+  on 3 November at about 11:12 UTC and answered as soon as it was opened. The Worker's own
+  requests had not woken it: artwork 1144, posted at 09:50, had been retried for 1.4 hours.
+- The 298 artworks posted in between (ids 813 to 1143) got their stats, hashes, AI description
+  and concepts, but neither an image vector nor a text vector. `/similar` answered
+  `method: "none"` for each of them; 812, posted at 02:29, was the last one with neighbours.
+  Semantic and image search could not find them, and copy detection skipped its vector pass.
+- Once the Space was back, the newest artworks (1144 to 1148) got their vectors within minutes.
+  The 298 did not: every failed embed or text attempt had counted, and the sweeper stops
+  re-driving a stage after 40. A couple of hours of retries had used them all up.
+- `/healthz` answered `{"ok": true, "semantic": true}` throughout: `semantic` meant
+  "`HF_EMBED_URL` is set".
+
+### What changed
+
+| | before | v4.8.2 |
+|---|---|---|
+| the Space's hardware | CPU basic, asleep after 48 h without traffic | CPU upgrade (8 vCPU, 32 GB, $0.03 an hour), never sleeps: `scripts/space_hardware.py`, called by `deploy.sh` and the new `deploy-space.sh` |
+| a failure on the Space's side (asleep, unreachable, timed out, 5xx, wrong token, another model or patch budget) | counted toward the 40-attempt cap | recorded on the job, not counted (`EmbedUnavailable.blame`, `setJob(…, { count })`); only a 400, 413 or 422, the Space refusing the input, counts |
+| jobs that reached the cap before | stranded for good | migration 0007 gives failed embed and text jobs a fresh count |
+| the sweeper while the Space is not ready | re-drove embed and text, which failed again | holds embed and text back (one `/health` check a minute, `spaceStatus`, shared through KV), logs why, and re-drives all that the outage missed once the Space is ready. On a `*.hf.space` host anything but the app's JSON is "not ready" (a 404 is a private Space without a valid token, or a deleted one); an endpoint elsewhere without a usable `/health` counts as ready, and the backlog check below still catches vectors that do not arrive |
+| the sweeper's budget per ten-minute run | 25 posts | 12 per embedding the Space computes at once, 25 to 200 (`sweepBudget`): 96 on 8 vCPU |
+| `/healthz` | `ok`, `posts`, `semantic` (configured), `text_vectors` | adds `status` (`ok` or `degraded`), `problems`, `embedding` (the Space's `/health`), `vectors` (the backlog, what is stuck, what was given up; counted once a minute per isolate); `semantic` means ready now; `?strict=1` answers 503 when degraded |
+| `/similar` for an artwork without a vector | `method: "none"`, no items | embeds the artwork for the request (`src/enrich/on-demand.ts`: same image, views, model and patch budget as the embed stage): `method: "hybrid"`, `vector: "computed"`. The vector is cached a day and the embed stage queued, which stores that vector without asking the Space again (`force` when the database says current but the index has none). Bounded: charged to the heavy rate limit (20 a minute, as `/search-by-image`), the image read from R2 (the chain within 5 s), 20 s for the Space, an image it refused left alone for six hours, no `/health` probe on the request (the last check decides), and nothing tried when the vector index itself fails. Otherwise `method: "features"`: shared concepts (weighted by rarity, scored in SQL) in the semantic part's place, then colours, shape and pHash, with a `note` saying why |
+
+`viewPng` and `embedImageViews` moved from `consumer.ts` to `src/enrich/views.ts` (still exported
+from `consumer.ts`), so that `/similar` can embed without importing the queue consumer, which
+reaches `src/search` through copy detection.
+
+### Using the 8 vCPU
+
+- The Space computes one embedding per CPU at once, each on one PyTorch thread (`hf/siglip.py`
+  reads its CPUs from the cgroup quota). On CPU upgrade `/health` should say `cpus: 8`,
+  `concurrency: 8`, `threads: 1`; no code in `hf/` had to change for that.
+- The queue consumer reads that concurrency from `/health` every ten minutes and works on as many
+  messages at once per invocation. With two invocations, 16 messages are in flight for 8 slots.
+- The sweeper's budget follows the same number: a backlog of a few hundred clears within the hour.
+- The model stays. README-V3 measured SigLIP 2 so400m (three times the size, 2.4 times the index
+  build) at the same image-vector score as base, and 1,024 patches no better than 576. More CPU
+  buys throughput and fresh vectors, not a better model.
+- The 2-vCPU table in `hf/README.md` ("Concurrency") has not been measured again on 8 vCPU:
+  `python3 hf/loadtest.py <space url> <token>` after the switch.
+
+### Deploying it
+
+1. `scripts/deploy-space.sh`: CPU upgrade, sleep never (the Space restarts), the variables, the
+   files of `hf/` (only `README.md` changed: `suggested_hardware: cpu-upgrade`), then waits until
+   it serves the Worker's model and prints its CPUs and concurrency.
+2. `scripts/deploy-worker.sh`: applies migration 0007, then deploys the Worker.
+3. The sweeper then re-drives the stranded artworks: 96 a run on 8 vCPU, so the 298 take about
+   40 minutes. To do it at once, `scripts/admin.sh reindex-all embed,text` (hash-keyed: artworks
+   that already have their vectors are skipped, at the cost of a chain read each).
+4. Check: `curl -s https://pixagram-search-v4.p1x4.workers.dev/healthz` shows `"status": "ok"`,
+   `embedding.cpus` 8 and `vectors.image_missing` 0; `scripts/admin.sh stats` shows
+   `artworks.embedded` equal to `artworks.n`; `/similar/1000` answers `method: "hybrid"`.
+5. Optional: point an uptime monitor at `/healthz?strict=1`.
+
+### Measured
+
+Offline: `npm test` runs 774 tests, 19 of them v4.8.2's (`test/space-outage.test.ts`). An asleep
+Space through 45 deliveries leaves the embed and text jobs at 0 attempts, and so does a Space
+that does not answer; a 422 for the image counts. Migration 0007 resets only failed embed and
+text jobs. The sweeper holds back while the Space answers with Hugging Face's page and re-drives
+all four artworks once it is ready, and it still gives up on a post's own failures. Its budget
+is 96, 25 and 200 at 8, 2 and 32 slots. The `/health` checks cover loading, another model,
+another patch budget, an HTML page, a 503, a 404 on a Space and on another host, a plain
+`/health` elsewhere, and the one-minute cache. `/healthz` is tested ok, degraded with the Space
+asleep (503 with `strict=1`) and degraded with a vector stuck for over an hour. `/similar` is
+tested computing on demand: no `/health` wait, cached, queued once, and stored by the queue
+without a second call to the Space. With the Space down it falls back to concepts and colours,
+and the next request does not wait again. A refused image is not sent twice. The heavy rate limit
+is honoured. A vector the index lost is restored with `force`. With the Space known down only
+the embed stage is queued. A failing vector index gets the fallback. An artwork whose embedding
+is skipped for good gets the fallback without the Space, and one sharing nothing gets `none`.
+`npm run typecheck` and `wrangler deploy --dry-run` pass. Before committing, a separate review
+of the diff found six problems: a 404 counted as ready, unbounded on-demand cost, a short probe
+shared through KV, gaps in the heal, uncached `/healthz` counts, and the concept cut-off. All
+six are fixed and tested above.
+
+### Not verified here
+
+Nothing was deployed or called live with these changes: there are no Cloudflare or Hugging Face
+credentials in this environment. Still to be seen: the hardware switch through the Hugging Face
+API, the throughput on 8 vCPU, migration 0007 on the production database, and how long the
+sweeper takes on the real backlog. The Space's logs would show why the Worker's requests did not
+wake it; with a Space that never sleeps, that no longer matters.

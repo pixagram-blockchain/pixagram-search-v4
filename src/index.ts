@@ -8,7 +8,7 @@ import { app } from "./api";
 import type { Env, EnrichMessage } from "./env";
 import { initCodecs } from "./enrich/decode";
 import { handleEnrichBatch } from "./enrich/consumer";
-import { sweep } from "./enrich/sweeper";
+import { sweep, sweepBudget } from "./enrich/sweeper";
 import { indexerStub } from "./chain/indexer-do";
 import { refreshCounters } from "./chain/refresh";
 import { refreshBackground } from "./search/background";
@@ -38,8 +38,15 @@ export default {
 
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     if (event.cron === "*/10 * * * *") {
-      // Sweeper: re-drive enrichment that exhausted its queue retries (e.g. a long Space outage).
-      ctx.waitUntil(sweep(env, 25).then((r) => r.enqueued && console.log("sweeper", JSON.stringify(r))).catch((e) => console.error("sweeper failed", e)));
+      // Sweeper: re-drive enrichment that exhausted its queue retries (e.g. a long Space outage),
+      // as much per run as the Space's CPUs embed (sweepBudget); while the Space is not ready it
+      // holds the embedding stages back and logs why.
+      ctx.waitUntil(
+        sweepBudget(env)
+          .then((max) => sweep(env, max))
+          .then((r) => (r.enqueued || r.held) && console.log("sweeper", JSON.stringify(r)))
+          .catch((e) => console.error("sweeper failed", e)),
+      );
       // Documentation: a conditional request to GitHub (free when nothing changed), then whatever
       // changed, plus vectors still missing. The push webhook, when configured, is faster.
       ctx.waitUntil(

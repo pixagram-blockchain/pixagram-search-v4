@@ -401,20 +401,30 @@ export async function updateCounters(db: D1Database, postId: number, netVotes: n
 
 type JobStatus = "queued" | "done" | "failed" | "skipped";
 
-/** `attempts` counts consecutive failures (the sweeper gives up at 40); a success resets it. */
-function jobStatement(db: D1Database, postId: number, stage: Stage, status: JobStatus, error?: string): D1PreparedStatement {
+/** Consecutive counted failures after which the sweeper stops re-driving a stage (src/enrich/sweeper.ts). */
+export const GIVE_UP_AFTER = 40;
+
+/**
+ * `attempts` counts consecutive failures (the sweeper gives up at GIVE_UP_AFTER); a success resets
+ * it. A failure that says nothing about the post, such as the embedding endpoint being asleep or
+ * unreachable, is recorded with `count: false`: the job shows the error but keeps its count, so
+ * an outage of any length never makes the sweeper give up on the posts it hit. (Before v4.8.2 it
+ * counted: the v4 Space stopped answering from 29 October to 3 November 2026, and 298 artworks
+ * reached the cap and stayed without vectors after it woke up.)
+ */
+function jobStatement(db: D1Database, postId: number, stage: Stage, status: JobStatus, error?: string, count = true): D1PreparedStatement {
   return db
     .prepare(
       `INSERT INTO jobs (post_id, stage, status, attempts, error, updated) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(post_id, stage) DO UPDATE SET status = excluded.status,
-         attempts = CASE excluded.status WHEN 'done' THEN 0 WHEN 'failed' THEN jobs.attempts + 1 ELSE jobs.attempts END,
+         attempts = CASE excluded.status WHEN 'done' THEN 0 WHEN 'failed' THEN jobs.attempts + ? ELSE jobs.attempts END,
          error = excluded.error, updated = excluded.updated`,
     )
-    .bind(postId, stage, status, status === "failed" ? 1 : 0, error ?? null, now());
+    .bind(postId, stage, status, status === "failed" && count ? 1 : 0, error ?? null, now(), count ? 1 : 0);
 }
 
-export async function setJob(db: D1Database, postId: number, stage: Stage, status: JobStatus, error?: string): Promise<void> {
-  await jobStatement(db, postId, stage, status, error).run();
+export async function setJob(db: D1Database, postId: number, stage: Stage, status: JobStatus, error?: string, o: { count?: boolean } = {}): Promise<void> {
+  await jobStatement(db, postId, stage, status, error, o.count ?? true).run();
 }
 
 /** Record a stage as done unless it already is (one statement; nothing written when it is). */

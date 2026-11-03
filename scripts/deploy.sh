@@ -9,6 +9,8 @@
 #   scripts/deploy.sh
 #
 # Overrides (env): SPACE_ID (primerz/pixagram-search-v4), CONFIG (wrangler.jsonc),
+#   SPACE_HARDWARE (cpu-upgrade: 8 vCPU, $0.03 an hour; "keep" leaves it as it is) and SPACE_SLEEP
+#   (-1 = never; see scripts/space_hardware.py),
 #   OLD_BASE (stack to compare against at the end; default the v3 Worker),
 #   SECRETS_FILE (~/.pixagram-search-v4.json), CLOUDFLARE_ACCOUNT_ID (only if your Cloudflare
 #   login has several accounts), SKIP_WAIT=1 (deploy only; skip indexing and the evaluation)
@@ -130,6 +132,8 @@ PY
 )
 info "Space files in sync → $SPACE_URL"
 patch_cfg hf_url "$SPACE_URL/embed"
+# v4.8.2: paid CPU that never sleeps (a sleeping Space left five days of artworks without vectors)
+python3 "$HERE/space_hardware.py" "$SPACE_ID" "${SPACE_HARDWARE:-cpu-upgrade}" "${SPACE_SLEEP:--1}"
 
 # ---- 2. D1 --------------------------------------------------------------------------------------
 step "2/10 D1 database $D1_NAME"
@@ -186,7 +190,7 @@ for q in "$QUEUE" "$DLQ"; do run_ok "queue $q" "${WR[@]}" queues create "$q"; do
 run_ok "R2 $R2_BUCKET" "${WR[@]}" r2 bucket create "$R2_BUCKET"
 
 # ---- 6. Schema ----------------------------------------------------------------------------------
-step "6/10 D1 migrations (0001 base schema, 0002 v3, 0003 documentation, 0004 suggestions, 0005 v4 answers, 0006 copy detection)"
+step "6/10 D1 migrations (0001 base schema, 0002 v3, 0003 documentation, 0004 suggestions, 0005 v4 answers, 0006 copy detection, 0007 outage attempts)"
 "${WR[@]}" d1 migrations apply "$D1_NAME" --remote -c "$CONFIG" </dev/null
 
 # ---- 7. Deploy + secrets ------------------------------------------------------------------------
