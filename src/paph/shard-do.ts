@@ -10,6 +10,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import { bool, int } from "../env";
 import { paphRuntime } from "./engine";
 import { ShardStore, type FindOptions, type FindResult, type PutResult, type WireInput, type WorkInfo, type WorkInput } from "./shard-store";
 
@@ -20,7 +21,12 @@ export class PaphShard extends DurableObject<Env> {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       const rt = await paphRuntime();
-      this.store = new ShardStore(ctx.storage.sql, (fn) => ctx.storage.transactionSync(fn), rt);
+      // each work's PAX1 sidecar beside its wires (1.3.0), while the database stays under its budget
+      const maxBytes = Math.max(0, int(env.PAPH_SIDECAR_MAX_MB, 6000)) * 1024 * 1024;
+      this.store = new ShardStore(ctx.storage.sql, (fn) => ctx.storage.transactionSync(fn), rt, {
+        sidecars: bool(env.PAPH_SIDECARS, true),
+        sidecarRoom: () => ctx.storage.sql.databaseSize < maxBytes,
+      });
       this.store.migrate();
     });
   }
@@ -71,6 +77,11 @@ export class PaphShard extends DurableObject<Env> {
 
   async rederive(limit = 200): Promise<Awaited<ReturnType<ShardStore["rederive"]>>> {
     return this.store.rederive(limit);
+  }
+
+  /** Store current sidecars for works that have none (or one of another profile or format). */
+  async refreshSidecars(limit = 200): Promise<Awaited<ReturnType<ShardStore["refreshSidecars"]>>> {
+    return this.store.refreshSidecars(limit);
   }
 
   async stats(): Promise<ReturnType<ShardStore["stats"]> & { bytes: number }> {

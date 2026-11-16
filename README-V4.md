@@ -249,11 +249,13 @@ Every artwork is fingerprinted when it is indexed, checked against every artwork
 it, and what the verifier concludes — `Identical`, `Copy`, `Suspected` — is stored with which of
 the two came first on chain. `GET /copies/:id` lists a work's copies in milliseconds (a D1 read);
 an uploaded image is checked across the whole index within a 900 ms budget (`POST
-/copies-by-image`), and its answer is kept for a day. The engine is `@pixagram/paph-x` 1.2.0
+/copies-by-image`), and its answer is kept for a day. The engine is `@pixagram/paph-x` 1.3.0
 (pinned): PAPH 4.2's wires in format 4 (sampling that commutes with mirrors and quarter turns) and
 comparator 42 under CAL-007, PAPH-X's cascade (XRank, profile X3-PROVISIONAL) to reach the same
 verdicts cheaply, and PAPH-SI (profile SI4-PROVISIONAL, fitted on the Pixa chain's own artworks
-hashed in wire 4) beside the exact index keys to find the few stored works worth comparing.
+hashed in wire 4) beside the exact index keys to find the few stored works worth comparing. Each
+shard keeps every work's PAX1 sidecar beside its wires, so the candidates a check verifies are
+read rather than derived (1.3.0), and every verdict says how it was reached and why.
 
 ```
 queue consumer:  stats ─► paph ─► embed (─► vector pass) ─► describe ─► concepts ─► text
@@ -261,17 +263,19 @@ queue consumer:  stats ─► paph ─► embed (─► vector pass) ─► desc
                            │ (and its wire-3 twin while some shard still holds works hashed before 1.2.0)
                            ▼
         home shard: PaphShard Durable Object holding post ids [i·S, (i+1)·S), S = PAPH_SHARD_SIZE
-          store the wires, index them: local codes + descriptor bands (exact keys), PAPH-SI keys
+          store the wires and the PAX1 sidecar, index them: local codes + descriptor bands (exact keys), PAPH-SI keys
                            │
                            ▼  every shard at once, each within the same budget (src/paph/budget.ts)
           nominate  codes and bands, rarest first, Σ 1/df, top K per family
                     ∪ PAPH-SI: probes rarest first, reached candidates scored exactly, best B
                     ∪ pHash neighbours (D1) ∪ embedding neighbours (Vectorize) ∪ previous partners
           verify    XRank, policy safe, copy scope; best candidates first, in batches, until the
-                    deadline; each stored side against the query of its own wire format
+                    deadline; each stored side read through its sidecar, against the query of its
+                    own wire format
                            ▼
         D1 paph_matches: (a = earlier by chain time, b = later), both images, verdict, evidence,
-        engine identity; artworks.paph_hash / paph_engine: the image and identity checked
+        execution and reason, engine identity; artworks.paph_hash / paph_engine: the image and
+        identity checked
 ```
 
 **Why an upload stays sub-second as the corpus grows.** Works are sharded by post-id range: the
@@ -298,8 +302,8 @@ and, at most once a second, for a background turn of four slices: a background c
 waited a second gets that turn ahead of the uploads, so background work completes under any
 load. A queue holds at most 64 checks per kind (beyond, the shard answers busy and the check is
 partial); a holder whose request was dropped loses the turn after 30 s (one timer per shard,
-armed only while checks wait, so an idle shard can hibernate). At ~0.25–0.35 s a check
-(below), a shard answers some 3–4 uploads a second; the day-long cache and the per-client limits
+armed only while checks wait, so an idle shard can hibernate). At ~0.2–0.3 s a check
+(below), a shard answers some 3–5 uploads a second; the day-long cache and the per-client limits
 keep repeated uploads off it.
 
 The stage's budget is five to ten times the interactive one (≤ 512 compared per shard, a
@@ -338,6 +342,33 @@ A first backfill of a large corpus checks every work against every shard, so its
 grows with the corpus times the number of shards; `PAPH_BUDGET_STAGE` can lighten it, and a later
 re-check (`scripts/admin.sh reindex-all paph force`) restores the thorough one.
 
+**Sidecars (1.3.0).** Verifying a candidate means preparing its stored side for PAPH-X — its
+route signature, bucket index and anchor order — which PAPH-X 1.3.0 measures at ~1.3 ms of
+WebAssembly on the chain's works (512 keypoints at the median), about twice the comparison
+itself. Each shard therefore keeps every work's PAX1 sidecar (~72 KB, in a `sidecars` table
+beside `works`) and prepares candidates through it, ~5× cheaper (~0.26 ms): an interactive check
+verifying 96 candidates saves about 100 ms of a shard's time, the stage's 512 about half a
+second. A sidecar is stored with the work (`put`) and named by
+what it was derived under (`x:<X profile> pax<format>`); one naming another profile or format is
+not read — the side is derived from its wires, the verdict the same — and a background check
+stores a current one for every side it had to derive (an interactive check never writes). The
+engine refuses any sidecar that does not describe the side it is given (another image, a damaged
+block), so a stored sidecar can cost time, never a verdict. Storage: a work takes ~120 KB with its
+sidecar instead of ~50 KB, so a shard stores no new sidecar once its database passes
+`PAPH_SIDECAR_MAX_MB` (6,000 of the 10 GB a Durable Object holds) — its later works verify from
+their wires, as before 1.3.0 — and `PAPH_SIDECARS=false` keeps none. `/admin/paph` shows, per shard,
+how many works have a current sidecar and whether there is room; `scripts/admin.sh paph-sidecars`
+(`POST /admin/paph/sidecars`) stores the missing ones, a batch per shard per call.
+
+**How and why (1.3.0).** Each verdict records its `execution` — `FAST`, or `FALLBACK` when
+comparator 42 decided because PAPH-X's own evidence was not enough to state it — and its
+`reason`: on the fast path how it decided (`exact-evidence`, `bounded-evidence`, `route`,
+`identical`), for a fallback why it deferred (`uncertified-geometry`, `control-saturated`,
+`pool-truncated`, or `certificate-unreachable`: a small or sparse work no certificate could hold
+for — expected for sprites, never evidence against a copy). Listings return both, and `identity`
+reads the engine identity field by field (package, comparator, calibration, X and SI profiles,
+keys, wire, policy).
+
 **Kept for a day.** An upload's comparisons are cached under its fingerprint (the same pixels in
 any encoding hit the same entry), the engine's identity and the budget, for `PAPH_CACHE_TTL`
 (86,400 s), and looked up before anything else is computed (with `semantic=1`, before the
@@ -347,8 +378,10 @@ shard or channel did not complete is kept for ten minutes only. Pair reports are
 both content hashes.
 
 **Precise.** Only XRank decides; the keys, PAPH-SI, pHash and the embeddings only nominate. Under
-the safe policy every `Copy` is comparator 42's or certified by PAPH-X's sparse geometry, and the
-listings show `Copy` and `Identical` unless asked (`min=suspected` is the lowest threshold:
+the safe policy every `Copy` is comparator 42's or certified by PAPH-X's sparse geometry. The
+stage stores `Copy` and `Identical` (`PAPH_MIN_VERDICT`, `copy` from 1.3.0; `suspected` keeps
+reviewers' leads too), alerts are `Copy` only, and the listings show `Copy` and `Identical` unless
+asked (`min=suspected` is the lowest threshold:
 `Suspected` is for review — on the chain's works CAL-004 read it on 222 of 14,412 pairs of two
 authors' works, on shared style alone; CAL-007 raises that one bar above the highest such pair
 and reads it on none, `Copy` on none either, and moves no `Copy`: PAPH-X 1.2.0). XRank screens
@@ -364,18 +397,21 @@ post was deleted anyway (its removal is best effort) is cleaned up by a nightly 
 shard (each shard on its own: one that fails does not stop the others).
 
 **Identity, and the next release.** Every verdict, every artwork's completed check and every
-cached answer carries the identity of what produced it — `paph-x/1.2.0 c50
+cached answer carries the identity of what produced it — `paph-x/1.3.0 c50
 CAL-007-PROVISIO:741afad9252f2ccb X3-PROVISIONAL:8af84dd0abb12192 si:aa8ce6d311f4ce56 k1 w4`
 (CAL-007's name field holds 16 characters) and the policy — so a new release, profile or
 `PAPH_POLICY` makes the stage re-check every work (the sweeper finds them too). A first deployment
-on 1.2.0 has nothing to re-derive; a later release that keeps the API (1.1.1, 1.1.2 and 1.2.0
-did) is moved to by:
+on 1.3.0 has nothing to re-derive; a later release that keeps the API (1.1.1, 1.1.2, 1.2.0 and
+1.3.0 did) is moved to by:
 
 ```bash
 npm install --save-exact @pixagram/paph-x@<version>  # and PAPH_X_VERSION in src/paph/engine.ts (a test checks it)
+npm run db:migrate                                  # 1.3.0: migrations/0008_paph_reason.sql (paph_matches.reason)
 npm test && npm run deploy
-scripts/admin.sh paph-rederive 500                  # repeat until remaining is 0: keys and SI signatures from the
-                                                    # stored wires, no image fetched (another wire format: rehash)
+scripts/admin.sh paph-rederive 500                  # repeat until remaining is 0: keys, SI signatures and (1.3.0)
+                                                    # sidecars from the stored wires, no image fetched (another
+                                                    # wire format: rehash)
+scripts/admin.sh paph-sidecars 500                  # 1.3.0: the sidecars a re-put did not store (no room then)
 scripts/admin.sh reindex-all paph                   # re-check every work under the new identity: from the stored
                                                     # wires, or from the image when they are on another format
 scripts/admin.sh paph-stale                         # verdicts no re-check has confirmed, and works still waiting
@@ -429,7 +465,7 @@ whose image can no longer be fetched keeps its wire-3 entry, compared through tw
 provisional verdicts stay; `paph-gc` removes entries of deleted posts as before.
 
 **Measured here** (Node, the real WebAssembly; `test/paph-store.test.ts`, `test/paph-flow.test.ts`,
-80 tests):
+87 tests):
 
 - mirrored, cropped, 2× upscaled, channel-swapped and pasted copies of a real Pixagram artwork
   are found as `Copy` among 24 procedural distractors, each through more than one nominator;
@@ -472,6 +508,16 @@ provisional verdicts stay; `paph-gc` removes entries of deleted posts as before.
 - the whole pipeline from the chain: ingest → stats → paph → `/copies` from both sides → a
   paph-only re-check that does not ask the chain → the copy deleted on chain leaves the index and
   the listings;
+- PAPH-X 1.3.0: a check through stored sidecars returns exactly the records of one from the
+  wires, with every side read through its sidecar and none derived; a sidecar of another X
+  profile or format is not read, and a background check (never an interactive one) stores a
+  current one in its place; a shard with no room stores none, and the sweep fills them in once
+  there is, passing over works still on wire 3 and sending refused wires to be re-hashed; a
+  removed or replaced work's sidecar goes with it; every record says why it was reached, and the
+  verdict's `execution` and `reason` reach D1 and the listings (a deferral's replacing the fast
+  path's), its identity parsed field by field; the stage stores `Copy` and up unless
+  `PAPH_MIN_VERDICT` says otherwise; `/admin/paph` reports the sidecars of every shard and
+  `/admin/paph/sidecars` is admin only;
 - the move to wire 4, on entries written as 1.1.2 wrote them (wire 3, SI3 signatures and
   postings): the format read from Tier 1's byte 4 (keypoints and index keys the same in both
   formats, a mixed pair refused); the re-derivation keeping their keys and dropping their SI3
@@ -488,19 +534,21 @@ A check's nomination, as a shard runs it, on a synthetic shard of 60,000 works (
 7.2 M code and 2.8 M SI postings with skewed key frequencies; 1.1 GB of SQLite on local disk;
 8 queries of 10,240 keys each): the document frequencies of the query's keys in 30 ms, the key
 nomination in 37 ms (≈ 11,000 postings read, max 57 ms), PAPH-SI's in 14 ms (max 29 ms) — about
-0.1 s in all. Preparing a stored work for XRank costs 0.4–0.7 ms on the two real fixtures (151
-and 208 keypoints; the chain's works have 512 at the median, so more there), and PAPH-X 1.2.0
-measures XRank at 0.65 ms a candidate natively under X3 (0.72 under X2) on pairs of the chain's
-own works, where the cascade runs whole (WebAssembly is about 1.2× native on its reference
-workload): ≤ 96 comparisons
-add ~0.15–0.25 s. A shard's interactive check is therefore ~0.25–0.35 s, inside its 600 ms
-deadline.
+0.1 s in all. Preparing a stored work for XRank costs ~1.3 ms of WebAssembly from its wires on
+the chain's works (512 keypoints at the median; PAPH-X 1.3.0 measured 60 of them) and ~0.26 ms
+through its sidecar, and PAPH-X 1.3.0 measures XRank at ~0.55 ms a candidate natively on the
+chain's own works (0.65 ms on 1.2.0's pairs under X3), where the cascade runs whole (WebAssembly
+is about 1.2× native on its reference workload): ≤ 96 candidates prepared and compared add
+~0.1 s through their sidecars, ~0.2 s from their wires. A shard's interactive check is therefore
+~0.2–0.3 s, inside its 600 ms deadline.
 
 **Not verified here.** Durable Object latency (cold starts, storage reads after eviction), how
 Cloudflare places shards in isolates, that the runtime advances its clock across the slices'
 yields (if it did not, the counts and the Worker's own timeout would still bound a check), and
-XRank's cost on the whole corpus (PAPH-X 1.2.0 measured 177 of the chain's works, re-hashed in
-wire 4: 648 µs a query natively under X3, against 717 under X2):
+what reading a 72 KB sidecar per candidate costs a shard's SQLite (~7 MB for 96 candidates), and
+XRank's cost on the whole corpus (PAPH-X 1.3.0 measured the newest 1,000 of the chain's 2,677
+works: ~0.55 ms a candidate natively, half of it the sparse scan, a third the structural
+channels):
 `/admin/paph` (queued checks per shard) and the `paph` log line of every stage (per-shard times,
 waits) report them. Recall on real copies at scale is PAPH's to measure (its SPEC-SI §9); the
 budgets are configuration (`PAPH_BUDGET_QUERY`, `PAPH_BUDGET_STAGE`).
@@ -870,109 +918,3 @@ credentials in this environment. Still to be seen: the hardware switch through t
 API, the throughput on 8 vCPU, migration 0007 on the production database, and how long the
 sweeper takes on the real backlog. The Space's logs would show why the Worker's requests did not
 wake it; with a Space that never sleeps, that no longer matters.
-
-## v4.8.3: no post left behind (November 2026)
-
-"Search stops working every four days" turned out to mean "new posts are missing from search",
-for two reasons that had nothing to do with the embedding Space (up for twelve days at the time)
-or the tail's health (no error since 2 November): the index left out a whole front end, and the
-tail silently dropped posts Hivemind had not processed yet. Backfills run by hand brought the
-second kind back, which is why it looked periodic.
-
-### What happened
-
-- **Pixtopia.** `APP_PREFIXES` was `pixagram`. Pixtopia, a third-party Pixa front end (app
-  `pixtopia/0.1.0`, the same artwork format: `format: "image"`, the body a WebP data URI), posted
-  for the first time on 1 November 2026 at 18:25 UTC and by mid-November wrote three posts in
-  four on the chain (167 on 15 November, against Pixagram's 51). All its posts up to 16 November
-  were left out: 1,093, of which 1,066 artworks and 27 blog posts.
-- **Hivemind behind the tail.** The tail reads each irreversible block about three seconds after
-  it is produced (one-block irreversibility: `lib` equals `head`) and asks `get_content` for
-  every post in it. `get_content` is answered by Hivemind, which sometimes had not processed
-  that block yet and answered `Post a/p does not exist`. Since the 13 October fix, that answer
-  meant "gone": the post was marked deleted (a no-op for a new post) and the tail moved on. At
-  least 50 Pixagram posts between 28 October and 15 November were lost that way, all of them
-  never edited, about 5 % of Pixagram's posts, including every post from 20:08 to 21:16 UTC on
-  12 November. A backfill started early on 16 November had restored 29 of them (authors a to j)
-  by 03:30 UTC; 21 were still missing.
-- Neither leak was visible: `/healthz` checked the Space and the vectors, not whether posts
-  arrived, and nothing logged a skipped app or a "missing" post.
-
-How Hivemind times a post, measured on api.pixagram.com on 16 November, on creations and edits
-alike: its `created` and `last_update` are the timestamp of the block *before* the op's (hived
-stamps a post with the head block time, which moves to a block's time only after that block's
-transactions are applied). An op in the block of 03:00:12 gives `last_update` 03:00:09. So once
-Hivemind has processed an op in block N, the post's `last_update` is at least the time of block
-N−1, and a smaller one means Hivemind has not got there yet.
-
-### What changed
-
-| | before | v4.8.3 |
-|---|---|---|
-| front ends indexed | `APP_PREFIXES: "pixagram"` | `APP_PREFIXES: ""`: every front end, Pixtopia and any launched later |
-| `get_content` says "does not exist" after a comment op | taken for a deletion: the post was dropped | the post is *deferred*: asked again on the following ticks (6 s, 12 s, 24 s … then every ten minutes, `deferBackoffMs`), at most `TAIL_DEFER_PER_TICK` (10) a tick, for `TAIL_DEFER_HOURS` (24); its version is recorded from the block at once. Only "was deleted", or an absence after a `delete_comment`, is a deletion |
-| Hivemind shows a post in a state older than the op (an edit, or a delete, it has not applied) | the older state was ingested, and the edit lost until the next one | deferred the same way (the op's `prevAt`, the time of the block before it, against Hivemind's `last_update`); past `TAIL_DEFER_HOURS`, the state Hivemind shows is kept, logged |
-| the time of the block before a range's first block | not needed | the last tick's (`lastBlockTime` in the state), else read from the chain once |
-| parked posts the node says "does not exist" for | settled (dropped) | kept after a comment op (the post exists); posts parked before v4.8.3, without an op, settle as they did |
-| anything else that slips through | a backfill by hand | `src/chain/reconcile.ts`: Hivemind's newest posts (`get_discussions_by_created`, bodies truncated: about 45 KB a page of 20) against the index, every ten minutes over `RECONCILE_HOURS` (3: one or two pages) and nightly over `RECONCILE_DEEP_HOURS` (48); a post missing, or whose `last_update` is newer than the index's, is ingested. Posts younger than five minutes are the tail's. Bounded per run (pages, ingests, time); `POST /admin/reconcile?hours=&max_ingest=` (`scripts/admin.sh reconcile [hours] [max_ingest]`) runs it by hand |
-| `/healthz` | the Space and the vectors | adds `tail`: `running`, `behind_blocks`, `last_tick_age_s`, `deferred`, `deferred_over_hour`, `parked`, and the reconciliation (last run, `recovered_total`, last recovery); `degraded` when the tail is stopped, stalled for ten minutes, more than an hour of blocks behind, or a post has waited for Hivemind for over an hour, or the indexer cannot be asked |
-| `scripts/admin.sh stats` | — | adds `reconcile` and `config.app_prefixes`; `indexer` adds `deferred`, `deferredWaiting`, `deferredTotal`, `deferredGivenUp` |
-
-Pixa's Hivemind starts the next page of `get_discussions_by_created` *after* the `start` post
-(Hive's condenser repeats it); the reconciliation keeps every post of a page and also copes with
-a node that repeats it.
-
-Pixtopia's licence is `{"type": "ALL_RIGHTS_RESERVED"}`, without PIXA's `rightsConfiguration`:
-its posts have `ai_training` unset, and with `AI_TRAINING_FALSE_BLOCKS` empty every stage runs
-on them, as on Pixagram's.
-
-### Deploying it
-
-1. `scripts/deploy-worker.sh`. No migration: the deferred posts live in the indexer's own
-   storage, and the reconciliation's record in `settings`.
-2. Bring in what was missed: `scripts/admin.sh backfill` (every account, 339 on 16 November,
-   with their history, so the versions are exact). It inserts Pixtopia's ~1,100 posts and the
-   Pixagram posts the tail lost, and queues their enrichment: about 1,100 descriptions on
-   Workers AI and as many embeddings on the Space, which 8 vCPU work through within the hour.
-   A backfill started before the deploy runs with the old filter and skips Pixtopia: start a new
-   one after it. `scripts/admin.sh reconcile 24` is the quick way for a recent gap of a day; for
-   two weeks the backfill is cheaper (the reconciliation walks the whole window on every call).
-3. Check: `/healthz` shows `tail` with `running: true`, `behind_blocks` near 0 and
-   `deferred_over_hour: 0`; `/search?author=conayi` (a Pixtopia artist) answers artworks; after a
-   day, `tail.reconcile.recovered_total` says how much the tail still misses (it should stay
-   at, or near, 0).
-
-### Measured
-
-Offline: `npm test` runs 791 tests, 17 of them v4.8.3's (`test/tail-hivemind.test.ts`): a post
-Hivemind does not hold yet is deferred, not deleted, its version recorded, and ingested once
-Hivemind shows it; it is not asked again before it is due; Hivemind's timing (the block before)
-lets a current post in at once, from the first block of a range too (one read of the block
-before, then the last tick's time); a stale edit is deferred until its `last_update` reaches the
-op; a `delete_comment` still shown is deferred, then deleted; "was deleted" after a comment op
-is final; the tail gives up after `TAIL_DEFER_HOURS`, keeping an older state or dropping a post
-never returned, logged; the list of deferred posts stays within one storage value (200 posts,
-100 KB: the oldest go, logged); a tick that fails after deferring a post counts it once;
-`retryParked` keeps a post Hivemind does not hold; the reconciliation
-ingests missing and stale posts from every front end inside its window, skips the newest five
-minutes and what is older than the window, pages after the `start` post, honours
-`APP_PREFIXES` and `maxIngest`, records its runs, and is off at 0; the deployed configuration
-indexes every front end; `/healthz` reports a deferred post over an hour, a stopped, stalled or
-far-behind tail, and an indexer it cannot ask. The new tests fail with the old "does not exist =
-deleted" rule, without the freshness check, with the op's own block time instead of the one
-before, and with the counter bumped before the list is saved. `npm run typecheck` and `wrangler deploy --dry-run` pass.
-
-Live, read-only, against api.pixagram.com on 16 November (in-memory database): the
-reconciliation over three hours read 2 pages, found 34 posts (29 Pixtopia, 5 Pixagram) and
-ingested every one as an artwork with its six stages queued, none failed, in 15 s; the freshness
-rule accepted the three newest posts' last ops and deferred each when asked for one block later.
-
-### Not verified here
-
-Nothing was deployed: there are no Cloudflare credentials in this environment. A Hivemind lag
-was not caught live: during nine minutes of watching (one new post, at 03:00 UTC) Hivemind
-answered at once. The lag is inferred: the lost posts were never edited, the tail recorded no
-error after 2 November, their app passed the filter, and the backfill inserted them as new rows,
-so the tail never stored them; a "does not exist" from Hivemind is the one path that drops a post
-without a trace. The reconciliation covers any other cause, and `tail.reconcile.recovered_total`
-will say whether one remains.

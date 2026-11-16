@@ -151,6 +151,7 @@ export async function findEverywhere(env: Env, query: WireInput, o: FindEverywhe
     stats: {
       nominated: { total: 0 },
       verified: 0, compared: 0, rejected: 0, capped: 0, pending: 0, unreadable: 0, legacy: 0,
+      sidecars: { read: 0, derived: 0, stored: 0 },
       postings: { keys: 0, si: 0 },
       skipped: { keys: 0, si: 0 },
       waitedMs: 0,
@@ -186,6 +187,11 @@ export async function findEverywhere(env: Env, query: WireInput, o: FindEverywhe
     s.pending += r.stats.pending;
     s.unreadable += r.stats.unreadable;
     s.legacy += r.stats.legacy ?? 0;
+    // (a shard still running code before 1.3.0 reports none, but answers under another identity:
+    // counted failed above)
+    s.sidecars.read += r.stats.sidecars?.read ?? 0;
+    s.sidecars.derived += r.stats.sidecars?.derived ?? 0;
+    s.sidecars.stored += r.stats.sidecars?.stored ?? 0;
     s.postings.keys += r.stats.postings.keys;
     s.postings.si += r.stats.postings.si;
     s.skipped.keys += r.stats.skipped.keys;

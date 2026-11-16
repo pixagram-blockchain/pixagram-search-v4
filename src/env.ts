@@ -73,14 +73,6 @@ export interface Env {
   TAIL_IDLE_SECONDS?: string;
   /** failed ticks in a row on the same post before the tail sets that post aside (default 6, about a minute) */
   TAIL_PARK_AFTER?: string;
-  /** v4.8.3: hours the tail keeps asking Hivemind for a post it has not caught up with (default 24) */
-  TAIL_DEFER_HOURS?: string;
-  /** v4.8.3: deferred posts asked again per tick (default 10) */
-  TAIL_DEFER_PER_TICK?: string;
-  /** v4.8.3: window of the ten-minute reconciliation with Hivemind's newest posts, in hours (default 3; 0 = off) */
-  RECONCILE_HOURS?: string;
-  /** v4.8.3: window of the nightly reconciliation, in hours (default 48; 0 = off) */
-  RECONCILE_DEEP_HOURS?: string;
   /** Walk each account's comment history during the backfill (post_versions). Default "true". */
   HISTORY_BACKFILL?: string;
   /** Max account_history calls per account in one backfill step (each scans ≤ 2000 ops). Default 300. */
@@ -216,8 +208,18 @@ export interface Env {
   PAPH_QUERY_MS?: string;
   /** Seconds an upload's answer is kept (default 86400; an answer with a shard missing: 600). */
   PAPH_CACHE_TTL?: string;
-  /** Verdicts the stage stores, at or above (default suspected; the API lists copy and up unless asked). */
+  /**
+   * Verdicts the stage stores, at or above (default copy since @pixagram/paph-x 1.3.0; "suspected"
+   * keeps the reviewer's leads too — the API lists copy and up unless asked, and alerts are Copy only).
+   */
   PAPH_MIN_VERDICT?: string;
+  /**
+   * "false": shards keep no PAX1 sidecars (default true: each work's beside its wires, ~72 KB, read
+   * instead of deriving the side — about 5× cheaper to verify against).
+   */
+  PAPH_SIDECARS?: string;
+  /** A shard stores no new sidecar once its database is this large, in MB (default 6000 of the 10 GB a Durable Object holds). */
+  PAPH_SIDECAR_MAX_MB?: string;
   /** XRank policy: safe (default: comparator 42's verdict on every pair it reports) | exact | fast. */
   PAPH_POLICY?: string;
   /** Hashing budget in pixels (default 768²); larger images are divided or box-filtered first. */

@@ -12,12 +12,7 @@ do after deploying it (re-embed the documentation, set `DOCS_MIN_SCORE`). **v4.8
 vectors complete through an embedding-Space outage, after one left 298 artworks without vectors
 and `/similar` empty for them: the Space runs on CPU upgrade without sleep, outages no longer use
 up a post's retries, `/healthz` reports the Space and the vector backlog, and `/similar` embeds an
-artwork on demand or falls back to concepts and colours (README-V4 "v4.8.2"). **v4.8.3** makes
-sure new posts reach the index: every front end is indexed (Pixtopia's posts, three in four on
-the chain by mid-November, were all filtered out), the tail waits for Hivemind instead of
-dropping a post it does not show yet (at least 50 Pixagram posts lost since 28 October), a
-reconciliation with Hivemind's newest posts catches anything else, and `/healthz` reports the
-tail (README-V4 "v4.8.3").
+artwork on demand or falls back to concepts and colours (README-V4 "v4.8.2").
 
 v4 keeps v3's deterministic search as the system of record and builds a retrieval, verification
 and reasoning engine around it. The Pixagram index decides what happened; a language model may
@@ -233,7 +228,7 @@ v3's variables keep their meaning:
 | var | default | meaning |
 |---|---|---|
 | `RPC_URL`, `RPC_FALLBACK_URLS` | api.pixagram.com, … | Hive-compatible JSON-RPC nodes |
-| `APP_PREFIXES` | (empty) | index posts whose `json_metadata.app` starts with one of these; empty = every front end (v4.8.3; was `pixagram`, which left Pixtopia out) |
+| `APP_PREFIXES` | `pixagram` | index posts whose `json_metadata.app` starts with one of these; empty = all |
 | `HF_EMBED_URL`, `HF_TOKEN` (secret) | the v4 Space | `https://<owner>-<space>.hf.space/embed`; empty disables semantic search |
 | `EMBED_MODEL`, `EMBED_DIM`, `EMBED_PATCHES`, `EMBED_VIEWS` | SigLIP 2 NaFlex, 768, 576, `xbrz` | as v3 (checked against the Space on every call) |
 | `TEXT_VECTORS` | `on` | SigLIP text vectors of artworks and blogs in `VEC_TEXT` |
@@ -247,8 +242,6 @@ v3's variables keep their meaning:
 | `DOCS_EMBED_MODEL`, `DOCS_EMBED_DIM`, `DOCS_MIN_SCORE`, `DOCS_QUERY_INSTRUCTION` | `@cf/qwen/qwen3-embedding-0.6b`, 1024, 0.4, (built in) | documentation vectors and relevance (v4.8.1: Qwen3-Embedding, questions embedded with the retrieval instruction; README-V4 "Models, October 2026" on re-embedding and the threshold) |
 | `SUGGEST_POPULAR` | `off` | popular searches in `/suggest` (see README-V3) |
 | `MARKET_CUSTOM_JSON_IDS`, `TAIL_BLOCKS_PER_TICK`, `TAIL_IDLE_SECONDS`, `TAIL_PARK_AFTER` | —, 100, 3, 6 | marketplace hook, tail pacing; failed ticks in a row on one post before the tail sets that post aside |
-| `TAIL_DEFER_HOURS`, `TAIL_DEFER_PER_TICK` | 24, 10 | v4.8.3: how long the tail keeps asking Hivemind for a post it does not show yet, and how many such posts per tick |
-| `RECONCILE_HOURS`, `RECONCILE_DEEP_HOURS` | 3, 48 | v4.8.3: window of the ten-minute and of the nightly reconciliation with Hivemind's newest posts; 0 turns either off |
 | `ADMIN_TOKEN`, `GITHUB_WEBHOOK_SECRET` (secrets) | — | `/admin/*` bearer token; the documentation push webhook |
 
 v4's (spec §57-58; every model is configuration):
@@ -534,7 +527,7 @@ nightly pass goes through every shard).
 |---|---|
 | `GET /similar/:id` | as v3, plus (v4.8.2) `vector`: `stored`, or `computed` when the artwork had no vector and was embedded for this request (charged to the heavy rate limit; cached a day; its embed stage is queued); `method`: `hybrid` (by the vector), `features` (no vector could be had: shared concepts, colours, shape and pHash, with `similarity.theme` in the semantic part's place, and a `note` saying why) or `none` |
 | `GET /duplicates/:id`, `POST /search-by-image` | as v3 |
-| `GET /healthz` | `ok` (the Worker and D1 answer), and since v4.8.2 `status` (`ok` or `degraded`), `problems`, `semantic` (the Space is ready now), `embedding` (the Space's `/health`: model, CPUs, concurrency; checked at most once a minute) and `vectors` (artworks and posts without a current vector, those missing for over an hour, jobs given up). `?strict=1` answers 503 when degraded, for an uptime monitor. Since v4.8.3 also `tail`: the chain indexer (`running`, `behind_blocks`, `last_tick_age_s`, posts `deferred` because Hivemind does not show them yet, `parked`) and the reconciliation (`reconcile`: its last run, posts recovered in all); degraded when the tail is stopped, stalled for ten minutes, an hour behind, or a post has waited for Hivemind for over an hour |
+| `GET /healthz` | `ok` (the Worker and D1 answer), and since v4.8.2 `status` (`ok` or `degraded`), `problems`, `semantic` (the Space is ready now), `embedding` (the Space's `/health`: model, CPUs, concurrency; checked at most once a minute) and `vectors` (artworks and posts without a current vector, those missing for over an hour, jobs given up). `?strict=1` answers 503 when degraded, for an uptime monitor |
 | `GET /history/:id`, `GET /posts/:id`, `/posts/:author/:permlink`, `GET /concepts`, `/img/…`, `/vocab` | as v3 |
 | `POST /feedback` | search engagement events (v3) |
 | `POST /ask/feedback` | `{query_id, rating: 1 \| -1, reason?: wrong \| unsupported \| incomplete \| other}`, for a recent answer |
@@ -612,14 +605,3 @@ checks to end by then (README-V4 "Copy detection").
   tries parked posts again. `scripts/admin.sh indexer` shows `cursor`, `lib`, `lastError`,
   `stuck` (the post failed ticks stopped on) and `parked`; a `cursor` far below `lib` with a
   `lastError` is a stalled tail.
-- "does not exist" is also what Hivemind answers for a post created in a block it has not
-  processed yet, and the tail reads each block about three seconds after it is produced. Until
-  v4.8.3 the tail took that for a deletion and dropped the post: at least 50 Pixagram posts
-  between 28 October and 15 November 2026, found only by backfills run by hand. Hivemind stamps a
-  post with the time of the block *before* its op, so the tail now knows which state an op must
-  leave (`OpRef.prevAt`) and defers a post Hivemind does not show yet, or shows in an older state
-  (`deferred`, `deferredWaiting` in `scripts/admin.sh indexer`); only "was deleted", or an absence
-  after a `delete_comment`, is a deletion. The reconciliation (`src/chain/reconcile.ts`,
-  `scripts/admin.sh reconcile [hours]`) compares Hivemind's newest posts with the index every ten
-  minutes and nightly. Pixa's Hivemind starts the next page of `get_discussions_by_created` after
-  the `start` post, not with it (Hive's condenser repeats it).

@@ -17,7 +17,7 @@
 // every work whose mark names another.
 
 import type { Env, Stage } from "../env";
-import { int, now } from "../env";
+import { bool, int, now } from "../env";
 import type { RgbaImage } from "../enrich/decode";
 import { embeddingEnabled } from "../enrich/embed";
 import { phash as phashOf } from "../enrich/phash";
@@ -41,7 +41,9 @@ export function policyOf(env: Pick<Env, "PAPH_POLICY">): Policy {
 const maxPixels = (env: Env): number => Math.max(64 * 64, int(env.PAPH_MAX_PIXELS, DEFAULT_MAX_PIXELS));
 const channelK = (env: Env): number => Math.min(64, Math.max(0, int(env.PAPH_CHANNEL_K, 24)));
 const phashDistance = (env: Env): number => Math.min(15, Math.max(0, int(env.PAPH_PHASH_DISTANCE, 10)));
-const storedMin = (env: Env): number => Math.max(STATE.Suspected, stateOf(env.PAPH_MIN_VERDICT, STATE.Suspected));
+// Copy and up unless PAPH_MIN_VERDICT asks for suspected too (the default from 1.3.0: a stored
+// Suspected is a reviewer's lead, not something to list or alert on)
+export const storedMin = (env: Pick<Env, "PAPH_MIN_VERDICT">): number => Math.max(STATE.Suspected, stateOf(env.PAPH_MIN_VERDICT, STATE.Copy));
 const queryMs = (env: Env): number => Math.min(30_000, Math.max(300, int(env.PAPH_QUERY_MS, 900)));
 const cacheTtl = (env: Env): number => Math.max(60, int(env.PAPH_CACHE_TTL, 86_400));
 /** An answer some shard (or channel) did not complete is kept for ten minutes, not a day. */
@@ -239,7 +241,7 @@ export async function writeCheck(
       a_hash: meFirst ? contentHash : m.contentHash, b_hash: meFirst ? m.contentHash : contentHash,
       other: other.id, other_hash: m.contentHash, verdict: m.verdict, state: m.state,
       certifiable: m.certifiable ? 1 : 0, certificate: m.certificate ? 1 : 0, lo: m.structuralLo, hi: m.structuralHi,
-      geometry: m.geometry, inliers: m.inliers, mirrored: m.mirrored ? 1 : 0, execution: m.execution,
+      geometry: m.geometry, inliers: m.inliers, mirrored: m.mirrored ? 1 : 0, execution: m.execution, reason: m.reason ?? "",
       same_author: me.author === other.author ? 1 : 0, via: m.via.join(","),
       engine: res.identity ? onWire(res.identity, m.wire ?? WIRE_VERSION) : null,
     });
@@ -265,12 +267,12 @@ export async function writeCheck(
   if (provisional.length) stmts.push(db.prepare(DELETE(" AND engine IS NOT ?4")).bind(postId, JSON.stringify(provisional), contentHash, res.identity));
   const INSERT = (guard: string) =>
     `INSERT INTO paph_matches (a, b, a_hash, b_hash, verdict, state, certifiable, certificate, structural_lo, structural_hi,
-       geometry, inliers, mirrored, execution, rescued, same_author, via, engine, computed)
+       geometry, inliers, mirrored, execution, reason, rescued, same_author, via, engine, computed)
      SELECT json_extract(j.value, '$.a'), json_extract(j.value, '$.b'), json_extract(j.value, '$.a_hash'), json_extract(j.value, '$.b_hash'),
             json_extract(j.value, '$.verdict'), json_extract(j.value, '$.state'), json_extract(j.value, '$.certifiable'),
             json_extract(j.value, '$.certificate'), json_extract(j.value, '$.lo'), json_extract(j.value, '$.hi'),
             json_extract(j.value, '$.geometry'), json_extract(j.value, '$.inliers'), json_extract(j.value, '$.mirrored'),
-            json_extract(j.value, '$.execution'), 0, json_extract(j.value, '$.same_author'),
+            json_extract(j.value, '$.execution'), json_extract(j.value, '$.reason'), 0, json_extract(j.value, '$.same_author'),
             json_extract(j.value, '$.via'), json_extract(j.value, '$.engine'), ?2
      FROM json_each(?1) AS j
      WHERE ${LIVE_IMAGE("json_extract(j.value, '$.other')", "json_extract(j.value, '$.other_hash')")}
@@ -278,7 +280,7 @@ export async function writeCheck(
      ON CONFLICT(a, b) DO UPDATE SET a_hash = excluded.a_hash, b_hash = excluded.b_hash, verdict = excluded.verdict,
        state = excluded.state, certifiable = excluded.certifiable, certificate = excluded.certificate,
        structural_lo = excluded.structural_lo, structural_hi = excluded.structural_hi, geometry = excluded.geometry,
-       inliers = excluded.inliers, mirrored = excluded.mirrored, execution = excluded.execution,
+       inliers = excluded.inliers, mirrored = excluded.mirrored, execution = excluded.execution, reason = excluded.reason,
        same_author = excluded.same_author, via = excluded.via, engine = excluded.engine, computed = excluded.computed${guard}`;
   const inserts: number[] = [];
   if (rows.length && res.identity) {
@@ -677,6 +679,12 @@ export interface CopyInfo {
   mirrored: boolean;
   /** how PAPH-X reached it: FAST, DEFERRED, FALLBACK (comparator 42 ran), AUDIT */
   execution: string;
+  /**
+   * why (@pixagram/paph-x 1.3.0; "" for verdicts stored before): for a FALLBACK why the cascade
+   * deferred — 'uncertified-geometry', 'certificate-unreachable' (a small or sparse work: no
+   * certificate could hold), 'control-saturated', 'pool-truncated'; else how it decided
+   */
+  reason: string;
   /** when the listed work was published relative to the one asked about (chain time) */
   relation: "earlier" | "later" | null;
   same_author: boolean | null;
@@ -684,10 +692,47 @@ export interface CopyInfo {
   via: string[];
   /** identity of the engine, profiles and policy behind the verdict */
   engine: string;
+  /** the same, read field by field: package, comparator, calibration, X and SI profiles, keys, wire, policy */
+  identity: VerdictIdentity;
   computed?: number;
 }
 
 export type CopyItem = SearchItem & { copy: CopyInfo };
+
+export interface VerdictIdentity {
+  package: string | null;
+  comparator: number | null;
+  calibration: { name: string; id: string } | null;
+  xprofile: { name: string; id: string } | null;
+  siprofile: string | null;
+  keys: number | null;
+  wire: number | null;
+  policy: string | null;
+}
+
+/**
+ * An engine identity string (engine.ts: "paph-x/1.3.0 c50 CAL-007-PROVISIO:741afad9… X3-PROVISIONAL:8af84dd0…
+ * si:aa8ce6d3… k1 w4 safe"), field by field; a field it does not name is null.
+ */
+export function parseIdentity(engine: string | null | undefined): VerdictIdentity {
+  const parts = (engine ?? "").trim().split(/\s+/).filter(Boolean);
+  const out: VerdictIdentity = { package: null, comparator: null, calibration: null, xprofile: null, siprofile: null, keys: null, wire: null, policy: null };
+  const named: Array<{ name: string; id: string }> = [];
+  for (const p of parts) {
+    let m: RegExpMatchArray | null;
+    if ((m = p.match(/^paph-x\/(.+)$/))) out.package = m[1];
+    else if ((m = p.match(/^c(\d+)$/))) out.comparator = Number(m[1]);
+    else if ((m = p.match(/^k(\d+)$/))) out.keys = Number(m[1]);
+    else if ((m = p.match(/^w(\d+)$/))) out.wire = Number(m[1]);
+    else if ((m = p.match(/^si:(.+)$/))) out.siprofile = m[1] === "-" ? null : m[1];
+    else if ((m = p.match(/^([^:]+):([0-9a-f]+)$/))) named.push({ name: m[1], id: m[2] });
+    else if (/^(safe|fast|exact)$/.test(p)) out.policy = p;
+  }
+  // the calibration comes first, the X profile second (engine.ts)
+  out.calibration = named[0] ?? null;
+  out.xprofile = named[1] ?? null;
+  return out;
+}
 
 export interface MatchRow {
   a: number;
@@ -704,6 +749,8 @@ export interface MatchRow {
   inliers: number;
   mirrored: number;
   execution: string;
+  /** null on a verdict stored before 1.3.0 */
+  reason: string | null;
   same_author: number;
   via: string;
   engine: string;
@@ -721,10 +768,12 @@ function copyFromRow(r: MatchRow, about: number): CopyInfo {
     inliers: r.inliers,
     mirrored: r.mirrored === 1,
     execution: r.execution,
+    reason: r.reason ?? "",
     relation: r.a === about ? "later" : "earlier",
     same_author: r.same_author === 1,
     via: r.via ? r.via.split(",") : [],
     engine: r.engine,
+    identity: parseIdentity(r.engine),
     computed: r.computed,
   };
 }
@@ -743,6 +792,8 @@ interface KeptMatch {
   inliers: number;
   mirrored: boolean;
   execution: string;
+  /** absent in an answer cached before 1.3.0 */
+  reason?: string;
   via: string[];
   /** the wire format the pair was compared in (absent: the current one) */
   wire?: number;
@@ -751,7 +802,7 @@ interface KeptMatch {
 const keep = (m: Match): KeptMatch => ({
   id: m.id, contentHash: m.contentHash, verdict: m.verdict, state: m.state, certifiable: m.certifiable, certificate: m.certificate,
   structuralLo: m.structuralLo, structuralHi: m.structuralHi, geometry: m.geometry, inliers: m.inliers, mirrored: m.mirrored,
-  execution: m.execution, via: m.via, ...(m.wire !== undefined && m.wire !== WIRE_VERSION ? { wire: m.wire } : {}),
+  execution: m.execution, reason: m.reason ?? "", via: m.via, ...(m.wire !== undefined && m.wire !== WIRE_VERSION ? { wire: m.wire } : {}),
 });
 
 function copyFromMatch(m: KeptMatch, about: PostMeta | null, item: SearchItem, engine: string): CopyInfo {
@@ -765,10 +816,12 @@ function copyFromMatch(m: KeptMatch, about: PostMeta | null, item: SearchItem, e
     inliers: m.inliers,
     mirrored: m.mirrored,
     execution: m.execution,
+    reason: m.reason ?? "",
     relation: about ? (earlier({ id: item.id, created: item.created, author: item.author }, about) ? "earlier" : "later") : null,
     same_author: about ? about.author === item.author : null,
     via: m.via,
     engine: onWire(engine, m.wire ?? WIRE_VERSION),
+    identity: parseIdentity(onWire(engine, m.wire ?? WIRE_VERSION)),
   };
 }
 
@@ -1149,6 +1202,8 @@ export async function paphStatus(env: Env): Promise<Record<string, unknown>> {
     query_ms: queryMs(env),
     cache_ttl: cacheTtl(env),
     shard_size: shardSize(env),
+    min_verdict: STATES[storedMin(env)],
+    sidecars: { kept: bool(env.PAPH_SIDECARS, true), max_mb: int(env.PAPH_SIDECAR_MAX_MB, 6000), format: rt.identity.sidecar },
     shards: calls.map((c) => (c.ok ? { shard: c.shard, ...c.value } : { shard: c.shard, error: c.error })),
     verdicts: verdicts.results,
     engines: engines.results,
@@ -1168,11 +1223,32 @@ export async function paphRederive(env: Env, limit: number): Promise<{ rederived
   return out;
 }
 
+/**
+ * Store current PAX1 sidecars in every shard, a batch each: for works that have none or one of
+ * another X profile or format (after a release `rederive` stores them as it re-puts each work;
+ * this sweep catches works put while a shard had no room or sidecars were off). Repeat until
+ * `remaining` is 0 or no shard has `room`.
+ */
+export async function paphSidecars(env: Env, limit: number): Promise<{ stored: number; remaining: number; full: number[]; failed: Array<{ shard: number; error: string }> }> {
+  const n = await shardCount(env);
+  const calls = await fanOut(env, Array.from({ length: n }, (_, i) => i), (stub) => stub.refreshSidecars(limit), 25_000);
+  const out = { stored: 0, remaining: 0, full: [] as number[], failed: [] as Array<{ shard: number; error: string }> };
+  for (const c of calls) {
+    if (!c.ok) out.failed.push({ shard: c.shard, error: c.error });
+    else {
+      out.stored += c.value.stored;
+      out.remaining += c.value.remaining;
+      if (!c.value.room) out.full.push(c.shard);
+    }
+  }
+  return out;
+}
+
 /** Cross-author copies found in the last `days`, about the works' current images, newest first: the earlier work is the candidate original. */
 export async function paphAlerts(env: Env, days: number, limit: number): Promise<Array<Record<string, unknown>>> {
   const r = await env.DB
     .prepare(
-      `SELECT m.a, m.b, m.verdict, m.state, m.certifiable, m.structural_lo, m.structural_hi, m.mirrored, m.via, m.engine, m.computed,
+      `SELECT m.a, m.b, m.verdict, m.state, m.certifiable, m.structural_lo, m.structural_hi, m.mirrored, m.execution, m.reason, m.via, m.engine, m.computed,
               pa.author AS a_author, pa.permlink AS a_permlink, pa.created AS a_created,
               pb.author AS b_author, pb.permlink AS b_permlink, pb.created AS b_created
        FROM paph_matches m JOIN posts pa ON pa.id = m.a JOIN posts pb ON pb.id = m.b

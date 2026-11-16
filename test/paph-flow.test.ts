@@ -14,7 +14,7 @@ import { base64Encode } from "../src/lib/bytes";
 import { STAGE_BUDGET } from "../src/paph/budget";
 import { STATE, fingerprint, type Fingerprint, type PaphRuntime } from "../src/paph/engine";
 import { findEverywhere, homeShard, resetShardCount, shardOf } from "../src/paph/shards";
-import { copiesOf, copiesOfImage, currentEngine, earlier, liveCopiesOf, pairReport, paphGc, paphGcPass, paphHealWire3, paphStage, paphStaleVerdicts, paphStatus, paphVectorPass, replaceMatches, resetLegacyStore, storeMayHoldLegacy, STAGE_GRACE_MS, STAGE_MIN_MS } from "../src/paph/copies";
+import { copiesOf, copiesOfImage, currentEngine, earlier, liveCopiesOf, pairReport, paphGc, paphGcPass, paphHealWire3, paphStage, paphStaleVerdicts, paphStatus, paphVectorPass, replaceMatches, resetLegacyStore, storedMin, storeMayHoldLegacy, STAGE_GRACE_MS, STAGE_MIN_MS } from "../src/paph/copies";
 import type { Checked, Match } from "../src/paph/shard-store";
 import { sweep } from "../src/enrich/sweeper";
 import { app } from "../src/api";
@@ -137,7 +137,7 @@ describe("verdicts in D1", () => {
   const copy = (id: number, extra: Partial<Match> = {}): Match => ({
     id, contentHash: `h${id}`, verdict: "Copy", state: 3, execution: "FAST", certifiable: true, certificate: false,
     structuralLo: 6500, structuralHi: 7000, geometry: 10000, inliers: 100, mirrored: false, swapped: false,
-    route: { local: 10, band: 5, global: 200, class: "FAST" }, via: ["codes"], ...extra,
+    route: { local: 10, band: 5, global: 200, class: "FAST" }, reason: "exact-evidence", via: ["codes"], ...extra,
   });
   const chk = (...ids: number[]): Checked[] => ids.map((id) => ({ id, contentHash: `h${id}` }));
   function seed() {
@@ -153,10 +153,14 @@ describe("verdicts in D1", () => {
     const { env, db, pairs } = seed();
     expect(await replaceMatches(env.DB, 2, "h2", { matches: [copy(1, { mirrored: true, via: ["codes", "si"] })], checked: chk(1, 3), identity }, identity)).toBe(1);
     expect(pairs()).toEqual(["1-2:Copy"]);
-    expect(db.prepare("SELECT a_hash, b_hash, engine, same_author, mirrored, via, structural_lo, structural_hi, execution, rescued FROM paph_matches").get()).toMatchObject({
+    expect(db.prepare("SELECT a_hash, b_hash, engine, same_author, mirrored, via, structural_lo, structural_hi, execution, reason, rescued FROM paph_matches").get()).toMatchObject({
       a_hash: "h1", b_hash: "h2", engine: identity, same_author: 0, mirrored: 1, via: "codes,si", structural_lo: 6500, structural_hi: 7000, execution: "FAST",
+      reason: "exact-evidence", // 1.3.0: why the cascade reached it so
       rescued: 0, // the first release's column, kept
     });
+    // a re-check that deferred replaces the reason with its own
+    await replaceMatches(env.DB, 2, "h2", { matches: [copy(1, { execution: "FALLBACK", reason: "certificate-unreachable" })], checked: chk(1), identity }, identity);
+    expect(db.prepare("SELECT execution, reason FROM paph_matches").get()).toEqual({ execution: "FALLBACK", reason: "certificate-unreachable" });
     expect(mark(db, 2)).toMatchObject({ paph_hash: "h2", paph_engine: identity });
   });
 
@@ -215,13 +219,22 @@ describe("verdicts in D1", () => {
     expect(mark(db, 2)).toMatchObject({ paph_hash: null });
   });
 
+  it("stores Copy and up by default, Suspected too when configured, nothing below Suspected (1.3.0)", () => {
+    expect(storedMin({})).toBe(3);
+    expect(storedMin({ PAPH_MIN_VERDICT: "" })).toBe(3);
+    expect(storedMin({ PAPH_MIN_VERDICT: "suspected" })).toBe(2);
+    expect(storedMin({ PAPH_MIN_VERDICT: "identical" })).toBe(4);
+    expect(storedMin({ PAPH_MIN_VERDICT: "related" })).toBe(2);
+    expect(storedMin({ PAPH_MIN_VERDICT: "nonsense" })).toBe(3);
+  });
+
   it("lists copies from both sides with the listed work's relation, and counts what it hides", async () => {
     const { env, db, post } = seed();
     post(4, "nsfw-copier", 400, "h4", { nsfw: true });
     await replaceMatches(env.DB, 2, "h2", { matches: [copy(1)], checked: chk(1), identity }, identity);
     await replaceMatches(env.DB, 4, "h4", { matches: [copy(1, { verdict: "Suspected", state: 2 })], checked: chk(1), identity }, identity);
     const fromOriginal = await copiesOf(env, 1, {});
-    expect(fromOriginal.items.map((it) => [it.id, it.copy.relation, it.copy.same_author, it.copy.engine])).toEqual([[2, "later", false, identity]]);
+    expect(fromOriginal.items.map((it) => [it.id, it.copy.relation, it.copy.same_author, it.copy.engine, it.copy.reason])).toEqual([[2, "later", false, identity, "exact-evidence"]]);
     const fromCopy = await copiesOf(env, 2, {});
     expect(fromCopy.items.map((it) => [it.id, it.copy.relation])).toEqual([[1, "earlier"]]);
     // marked under another identity than the engine's: not "indexed" for the current one
@@ -950,7 +963,12 @@ describe("interactive checks", () => {
     expect(stored.status).toBe(200);
     expect(stored.body.items.map((it: any) => [it.id, it.copy.verdict, it.copy.relation])).toEqual([[2500, "Copy", "later"]]);
     expect((await call(w.env, "/copies/1?live=1")).status).toBe(403);
-    expect((await call(w.env, "/copies/1?live=1", { admin: true })).body.method).toBe("live");
+    const live = (await call(w.env, "/copies/1?live=1", { admin: true })).body;
+    expect(live.method).toBe("live");
+    // 1.3.0: every candidate the live check verified, in every shard, was read through its stored
+    // sidecar; an interactive check stores none
+    expect(live.stats.verified).toBeGreaterThan(0);
+    expect(live.stats.sidecars).toEqual({ read: live.stats.verified, derived: 0, stored: 0 });
     const png = await encodePng(mirror(small));
     const form = new FormData();
     form.set("image", new Blob([png.slice().buffer as ArrayBuffer], { type: "image/png" }), "x.png");
@@ -969,6 +987,12 @@ describe("interactive checks", () => {
     expect((await call(w.env, "/copies/5/report/333333333333")).status).toBe(404);
     expect([...w.paph.shards.keys()].sort()).toEqual(shards);
     expect((await call(w.env, "/copies/1?min=unrelated")).body.min).toBe("Suspected");
+    // 1.3.0: the sidecar sweep (admin only) — every indexed work already has a current sidecar
+    expect((await call(w.env, "/admin/paph/sidecars", { method: "POST" })).status).toBe(401);
+    expect((await call(w.env, "/admin/paph/sidecars?limit=50", { method: "POST", admin: true })).body).toEqual({ stored: 0, remaining: 0, full: [], failed: [] });
+    const status = (await call(w.env, "/admin/paph", { admin: true })).body;
+    expect(status).toMatchObject({ min_verdict: "Copy", sidecars: { kept: true, max_mb: 6000, format: "x:8af84dd0abb12192 pax3" } });
+    expect(status.shards.every((sh: any) => sh.sidecars.stored === sh.works && sh.sidecars.current === sh.works)).toBe(true);
     const off = makeEnv({});
     expect((await call(off, "/copies/1")).status).toBe(503);
     expect((await call(off, "/copies-by-image", { method: "POST", body: form })).status).toBe(503);
@@ -1185,6 +1209,17 @@ describe("the pipeline, from the chain", () => {
     expect(pairs()).toEqual([`${ids.alice}-${ids.bob}:Copy`]);
     const fromOriginal = await call(env, `/copies/${ids.alice}`);
     expect(fromOriginal.body.items.map((it: any) => [it.author, it.copy.relation, it.copy.mirrored])).toEqual([["bob", "later", true]]);
+    // 1.3.0: how and why it was reached, and what reached it, field by field
+    const c = fromOriginal.body.items[0].copy;
+    expect(c.execution).toMatch(/FAST|FALLBACK/);
+    expect(c.reason).toMatch(/^(exact-evidence|bounded-evidence|route|identical|uncertified-geometry|certificate-unreachable|control-saturated|pool-truncated)$/);
+    expect(c.identity).toEqual({
+      package: "1.3.0", comparator: 50, calibration: { name: "CAL-007-PROVISIO", id: "741afad9252f2ccb" },
+      xprofile: { name: "X3-PROVISIONAL", id: "8af84dd0abb12192" }, siprofile: "aa8ce6d311f4ce56", keys: 1, wire: 4, policy: "safe",
+    });
+    // every indexed work keeps its sidecar beside its wires, and the shard verifies through them
+    const facts = await homeShard(env, ids.alice).stats();
+    expect(facts.sidecars).toMatchObject({ kept: true, room: true, stored: 3, current: 3 });
     expect((await call(env, `/copies/${ids.bob}`)).body.items.map((it: any) => [it.author, it.copy.relation])).toEqual([["alice", "earlier"]]);
     // a paph-only re-check (after a release) reuses the stored wires: the chain is not asked
     const rpcBefore = net.calls.length;

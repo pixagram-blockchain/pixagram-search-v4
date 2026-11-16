@@ -18,10 +18,18 @@
 // moved: the stage re-checks every work, and hashes again a work whose stored wires are wire 3).
 // Until a shard holds no wire-3 work, a query is hashed in both formats and each stored side is
 // compared with the query of its own format (SPEC-W4 §9, shard-store.ts and copies.ts).
+//
+// 1.3.0 keeps the wire, the comparator, the calibration and every profile (the same verdicts,
+// byte for byte), and makes a stored side cheaper to verify against: a shard keeps each work's
+// PAX1 sidecar beside its wires (version 3, which 1.3.0 actually reads — about 5× cheaper than
+// deriving the side, ~72 KB a work) and every verdict records why the cascade reached it the way
+// it did (`reason`: for a FALLBACK, why it deferred). The identity names the package, so the
+// stage re-checks every work and `rederive` stores the sidecars.
 
 import {
   init,
   KEYS_VERSION,
+  SIDECAR_VERSION,
   STATES,
   WIRE_VERSION,
   type Engine,
@@ -32,15 +40,15 @@ import {
 } from "@pixagram/paph-x/wasm";
 import type { RgbaImage } from "../enrich/decode";
 
-export type { Engine, Policy, SIProfile, XProfile, XRankRecord, XSide, XReport, RouteReading, SIPlan } from "@pixagram/paph-x/wasm";
-export { KEYS_VERSION, STATES, WIRE_VERSION };
+export type { Engine, Policy, SIProfile, XProfile, XRankRecord, XSide, XReport, RouteReading, SIPlan, SidecarState } from "@pixagram/paph-x/wasm";
+export { KEYS_VERSION, SIDECAR_VERSION, STATES, WIRE_VERSION };
 
 /**
  * The installed @pixagram/paph-x version. Bump it with the dependency (a test compares it with
  * node_modules): it is part of every identity, so results of another release never pass for
  * this one's.
  */
-export const PAPH_X_VERSION = "1.2.0";
+export const PAPH_X_VERSION = "1.3.0";
 
 let mod: WebAssembly.Module | null = null;
 let artefacts: { base?: Uint8Array; x?: Uint8Array; si?: Uint8Array } = {};
@@ -88,6 +96,9 @@ export interface Identity {
   siprofileId: string | null;
   keys: number;
   wire: number;
+  /** what a stored PAX1 sidecar must have been derived under to be read: the X profile and the
+   *  sidecar format (1.3.0) — a shard refreshes the sidecars that name another */
+  sidecar: string;
 }
 
 export interface PaphRuntime {
@@ -163,6 +174,7 @@ function build(engine: Engine): PaphRuntime {
     siprofileId: siId,
     keys: KEYS_VERSION,
     wire: WIRE_VERSION,
+    sidecar: `x:${xid.slice(0, 16)} pax${SIDECAR_VERSION}`,
   };
   return { engine, x, si, siOff, identity, derivation: `paph-x/${PAPH_X_VERSION} k${KEYS_VERSION} x:${xid.slice(0, 16)} si:${siId ?? "-"}` };
 }

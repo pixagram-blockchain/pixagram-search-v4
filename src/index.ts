@@ -6,13 +6,11 @@ import PNG_WASM from "@jsquash/png/codec/pkg/squoosh_png_bg.wasm";
 import PAPH_WASM from "@pixagram/paph-x/wasm/paph.wasm";
 import { app } from "./api";
 import type { Env, EnrichMessage } from "./env";
-import { num } from "./env";
 import { initCodecs } from "./enrich/decode";
 import { handleEnrichBatch } from "./enrich/consumer";
 import { sweep, sweepBudget } from "./enrich/sweeper";
 import { indexerStub } from "./chain/indexer-do";
 import { refreshCounters } from "./chain/refresh";
-import { reconcileRecent } from "./chain/reconcile";
 import { refreshBackground } from "./search/background";
 import { pruneLogs } from "./search/feedback";
 import { syncDocs } from "./docs/sync";
@@ -69,20 +67,10 @@ export default {
       } catch (e) {
         console.error("parked retry failed", e);
       }
-      // v4.8.3: Hivemind's newest posts of the last RECONCILE_HOURS against the index; anything the
-      // tail missed is ingested now (logged by reconcileRecent).
-      ctx.waitUntil(reconcileRecent(env).catch((e) => console.error("reconcile failed", e)));
       return;
     }
     // Nightly: counters of posts inside their payout window, background samples, log retention.
     ctx.waitUntil(refreshCounters(env));
-    // v4.8.3: the reconciliation over two days (RECONCILE_DEEP_HOURS), for anything older than the
-    // ten-minute runs look at.
-    ctx.waitUntil(
-      reconcileRecent(env, { hours: num(env.RECONCILE_DEEP_HOURS, 48), maxPages: 200, maxIngest: 300, budgetMs: 600_000 })
-        .then((r) => console.log("reconcile nightly", JSON.stringify(r)))
-        .catch((e) => console.error("reconcile nightly failed", e)),
-    );
     ctx.waitUntil(Promise.all([refreshBackground(env, "image"), refreshBackground(env, "text")]).catch((e) => console.error("background refresh failed", e)));
     ctx.waitUntil(pruneLogs(env).catch((e) => console.error("prune failed", e)));
     // copy detection: works whose posts were deleted leave the shards (their removal is best effort);

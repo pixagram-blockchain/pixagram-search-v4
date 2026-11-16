@@ -28,25 +28,10 @@ export class RpcError extends Error {
  * post, "Assert Exception:Post a/p does not exist" (code -32602) for one never created.
  */
 export function isMissingPost(e: unknown, author: string, permlink: string): boolean {
-  return missingReason(e, author, permlink) !== null;
-}
-
-/**
- * Why the node refused a post: "deleted" (Hivemind says it was deleted: final) or "unknown" (it
- * does not hold the post: never created, or created in a block Hivemind has not processed yet).
- * null: the error says nothing about this post's absence.
- */
-export function missingReason(e: unknown, author: string, permlink: string): "deleted" | "unknown" | null {
-  if (!(e instanceof RpcError)) return null;
+  if (!(e instanceof RpcError)) return false;
   const text = `${e.message} ${typeof e.data === "string" ? e.data : JSON.stringify(e.data ?? "")}`;
-  if (!text.includes(`Post ${author}/${permlink} `)) return null;
-  if (/\bwas deleted\b/i.test(text)) return "deleted";
-  if (/\bdoes not exist\b/i.test(text)) return "unknown";
-  return null;
+  return text.includes(`Post ${author}/${permlink} `) && /\b(?:was deleted|does not exist)\b/i.test(text);
 }
-
-/** What get_content says about a post: its current state, or why the node does not return it. */
-export type ContentState = { post: CondenserPost } | { absent: "deleted" | "unknown" };
 
 export class ChainRpc {
   private readonly urls: string[];
@@ -118,27 +103,15 @@ export class ChainRpc {
    * Hivemind asserts (see isMissingPost): both are an answer about the post, not a failure.
    */
   async getContent(author: string, permlink: string): Promise<CondenserPost | null> {
-    const s = await this.getContentState(author, permlink);
-    return "post" in s ? s.post : null;
-  }
-
-  /**
-   * get_content, telling a deleted post ("was deleted": final) from one the node does not hold
-   * ("does not exist", or a legacy node's empty object). The second is also what Hivemind answers
-   * for a post created in a block it has not processed yet: the tail must not take it for a
-   * deletion (src/chain/indexer-do.ts).
-   */
-  async getContentState(author: string, permlink: string): Promise<ContentState> {
     let r: CondenserPost;
     try {
       r = await this.call<CondenserPost>("condenser_api.get_content", [author, permlink]);
     } catch (e) {
-      const why = missingReason(e, author, permlink);
-      if (why) return { absent: why };
+      if (isMissingPost(e, author, permlink)) return null;
       throw e;
     }
-    if (!r || !r.author) return { absent: "unknown" };
-    return { post: r };
+    if (!r || !r.author) return null;
+    return r;
   }
 
   /** Account names after `start` (inclusive), up to `limit` (max 1000). */
@@ -159,19 +132,10 @@ export class ChainRpc {
     });
   }
 
-  /**
-   * Newest posts chain-wide, 20 per page (Hivemind's limit). Pixa's Hivemind starts the page after
-   * `start` (Hive's condenser repeats it). Used by the reconciliation (src/chain/reconcile.ts) to
-   * spot anything the tail missed; `truncateBody` keeps an artwork's data URI out of the page.
-   */
-  getDiscussionsByCreated(start?: { author: string; permlink: string }, limit = 20, truncateBody?: number) {
+  /** Newest posts chain-wide, 20 per page. Used by the watchdog to spot anything the tail missed. */
+  getDiscussionsByCreated(start?: { author: string; permlink: string }, limit = 20) {
     return this.call<CondenserPost[]>("condenser_api.get_discussions_by_created", [
-      {
-        tag: "",
-        limit,
-        ...(truncateBody ? { truncate_body: truncateBody } : {}),
-        ...(start ? { start_author: start.author, start_permlink: start.permlink } : {}),
-      },
+      { tag: "", limit, ...(start ? { start_author: start.author, start_permlink: start.permlink } : {}) },
     ]);
   }
 

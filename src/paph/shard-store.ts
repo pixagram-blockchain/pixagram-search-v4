@@ -14,6 +14,14 @@
 //   df        how many works hold each key: 1/df weights, the rarest-first order, the df cap
 //   meta      running counts (postings per kind), so a status read scans nothing
 //
+//   sidecars  each work's PAX1 sidecar (@pixagram/paph-x 1.3.0): the route, bucket index and anchor
+//             order PAPH-X derives from the wires, stored so a check reads them instead of deriving
+//             them for every candidate it verifies (~72 KB a work, ~5× cheaper to prepare). Named by
+//             what they were derived under (the X profile, the sidecar format): a sidecar naming
+//             another is not read, and background checks and `refreshSidecars` store a current one.
+//             None is stored once the shard's database passes its budget (`sidecarRoom`): those
+//             works verify from their wires, as before 1.3.0
+//
 // A check (find) is bounded by a Budget (budget.ts) in every step that grows with the shard, so
 // its work does not depend on how many works the shard holds. Keys and SI only nominate; XRank
 // (policy safe, copy scope) decides.
@@ -125,6 +133,13 @@ export interface Match {
   mirrored: boolean;
   swapped: boolean;
   route: RouteReading;
+  /**
+   * How the cascade reached it (@pixagram/paph-x 1.3.0): for a FALLBACK, why it deferred to
+   * comparator 42 — 'uncertified-geometry', 'certificate-unreachable' (a small or sparse work no
+   * certificate could hold for), 'control-saturated', 'pool-truncated'; on the fast path the way
+   * it decided ('exact-evidence', 'bounded-evidence', 'route', 'identical')
+   */
+  reason: string;
   /** channels that nominated it: codes, bands, si, phash, vector, previous */
   via: string[];
   /** the wire format both sides were compared in (absent: the current one) */
@@ -156,6 +171,11 @@ export interface ShardStats {
   unreadable: number;
   /** the shard holds works on another wire format than the current one (1, else 0; merged: shards that do) */
   legacy: number;
+  /**
+   * Candidate sides prepared through their stored sidecar, prepared from their wires (none
+   * stored, or one naming another profile or format), and sidecars this check stored for them
+   */
+  sidecars: { read: number; derived: number; stored: number };
   /** posting rows read by each nominator, and query keys left unread (df cap or budget) */
   postings: { keys: number; si: number };
   skipped: { keys: number; si: number };
@@ -427,10 +447,34 @@ export const SQL = {
      GROUP BY p.post_id`,
   /** ?1 post ids, ?2 the current derivation (a signature of another SI profile does not score) */
   loadSigs: "SELECT post_id, si_sig FROM works WHERE post_id IN (SELECT value FROM json_each(?1)) AND derivation = ?2 AND si_sig IS NOT NULL",
-  /** ?1 post ids */
-  loadWires: "SELECT post_id, content_hash, wire, t1, t2 FROM works WHERE post_id IN (SELECT value FROM json_each(?1))",
+  /** ?1 post ids: the wires, and the sidecar stored for the same image */
+  loadWires: `SELECT w.post_id AS post_id, w.content_hash AS content_hash, w.wire AS wire, w.t1 AS t1, w.t2 AS t2,
+                     s.sidecar_id AS sidecar_id, s.bytes AS sidecar
+              FROM works w LEFT JOIN sidecars s ON s.post_id = w.post_id AND s.content_hash = w.content_hash
+              WHERE w.post_id IN (SELECT value FROM json_each(?1))`,
+  /** ?1 post id, ?2 content hash, ?3 sidecar id, ?4 bytes: only while the entry shows that image */
+  putSidecar: `INSERT INTO sidecars (post_id, content_hash, sidecar_id, bytes)
+               SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM works WHERE post_id = ?1 AND content_hash = ?2)
+               ON CONFLICT(post_id) DO UPDATE SET content_hash = excluded.content_hash, sidecar_id = excluded.sidecar_id, bytes = excluded.bytes`,
+
   /** ?1 the current wire format: does the shard hold a work on another (two index probes, whatever its size) */
   legacy: "SELECT EXISTS (SELECT 1 FROM works WHERE wire < ?1) OR EXISTS (SELECT 1 FROM works WHERE wire > ?1) AS legacy",
+};
+
+/** Maintenance statements: sweeps that page through the works (not part of a check or an index write). */
+export const SWEEP = {
+  /**
+   * ?1 the current derivation, ?2 the current sidecar id, ?3 the current wire format, ?4 limit:
+   * works on the current wires whose sidecar is missing or names another (a work on another wire
+   * format gets one with its re-hash)
+   */
+  staleSidecars: `SELECT w.post_id AS post_id, w.content_hash AS content_hash FROM works w
+                  LEFT JOIN sidecars s ON s.post_id = w.post_id AND s.content_hash = w.content_hash AND s.sidecar_id = ?2
+                  WHERE w.derivation = ?1 AND w.wire = ?3 AND s.post_id IS NULL ORDER BY w.post_id LIMIT ?4`,
+  /** ?1 the current derivation, ?2 the current sidecar id, ?3 the current wire format: how many such works are left */
+  staleSidecarCount: `SELECT COUNT(*) AS n FROM works w
+                      LEFT JOIN sidecars s ON s.post_id = w.post_id AND s.content_hash = w.content_hash AND s.sidecar_id = ?2
+                      WHERE w.derivation = ?1 AND w.wire = ?3 AND s.post_id IS NULL`,
 };
 
 export const SCHEMA = [
@@ -466,6 +510,14 @@ export const SCHEMA = [
    )`,
   // which works are on which wire format (1.2.0: wire 4; works hashed before, wire 3 until re-hashed)
   `CREATE INDEX IF NOT EXISTS works_wire ON works (wire)`,
+  // each work's PAX1 sidecar (1.3.0), for the image its wires were hashed from, and what it was
+  // derived under: small columns first, the ~72 KB block last
+  `CREATE TABLE IF NOT EXISTS sidecars (
+     post_id      INTEGER PRIMARY KEY,
+     content_hash TEXT    NOT NULL,
+     sidecar_id   TEXT    NOT NULL,
+     bytes        BLOB    NOT NULL
+   )`,
 ];
 
 interface Nom {
@@ -531,12 +583,18 @@ export interface ShardStoreOptions {
   maxQueued?: number;
   /** slices an aged background grant keeps the turn (default 4) */
   agedSlices?: number;
+  /** keep each work's PAX1 sidecar beside its wires and verify through it (default true) */
+  sidecars?: boolean;
+  /** whether the shard may store another sidecar (the Durable Object: its database under PAPH_SIDECAR_MAX_MB) */
+  sidecarRoom?: () => boolean;
 }
 
 export class ShardStore {
   readonly turns: Turns;
   private readonly pause: () => Promise<void>;
   private readonly chunk: number;
+  private readonly keepSidecars: boolean;
+  private readonly sidecarRoom: () => boolean;
 
   constructor(
     private readonly sql: Sql,
@@ -547,6 +605,15 @@ export class ShardStore {
     this.pause = opts.pause ?? yieldToRuntime;
     this.chunk = Math.max(1, opts.chunkPostings ?? CHUNK_POSTINGS);
     this.turns = new Turns(opts.ageMs ?? 1_000, opts.maxQueued ?? 64, opts.agedSlices ?? 4);
+    this.keepSidecars = opts.sidecars ?? true;
+    this.sidecarRoom = opts.sidecarRoom ?? (() => true);
+  }
+
+  /** Store a side's sidecar (only while the entry shows `contentHash`); false when there is no room or none is kept. */
+  private storeSidecar(postId: number, contentHash: string, side: XSide): boolean {
+    if (!this.keepSidecars || !this.sidecarRoom()) return false;
+    this.sql.exec(SQL.putSidecar, postId, contentHash, this.rt.identity.sidecar, blob(side.sidecar())).toArray();
+    return true;
   }
 
   /** Run background work in turns; `slice()` ends a slice (yield, and step aside for interactive work). */
@@ -603,6 +670,8 @@ export class ShardStore {
           )
           .toArray();
         this.index(w.postId, set);
+        // the side's sidecar, for this image (one for an older image is never read: dropped)
+        if (!this.storeSidecar(w.postId, w.contentHash, xs)) this.sql.exec("DELETE FROM sidecars WHERE post_id = ?", w.postId).toArray();
       });
       return { keys: { codes: set.c.length, bands: set.b.length, si: set.s.length }, replaced };
     } finally {
@@ -650,6 +719,7 @@ export class ShardStore {
       if (!old) return;
       this.unindex(postId, unpackKeys(asBytes(old.keys)!));
       this.sql.exec("DELETE FROM works WHERE post_id = ?", postId).toArray();
+      this.sql.exec("DELETE FROM sidecars WHERE post_id = ?", postId).toArray();
       found = true;
     });
     return found;
@@ -802,6 +872,7 @@ export class ShardStore {
       nominated: { total: 0 },
       verified: 0, compared: 0, rejected: 0, capped: 0, pending: 0, unreadable: 0,
       legacy: this.holdsLegacy() ? 1 : 0,
+      sidecars: { read: 0, derived: 0, stored: 0 },
       postings: { keys: 0, si: 0 },
       skipped: { keys: 0, si: 0 },
       ms: 0,
@@ -856,7 +927,8 @@ export class ShardStore {
       let at = 0;
       for (; at < list.length && !cut; at += BATCH) {
         if (!(await step())) break;
-        this.rank(sideFor, list.slice(at, at + BATCH), policy, results, stats);
+        // a background check stores a current sidecar for every side it had to derive
+        this.rank(sideFor, list.slice(at, at + BATCH), policy, results, stats, o.priority === "background");
       }
       stats.pending = Math.max(0, list.length - at);
 
@@ -887,6 +959,7 @@ export class ShardStore {
           mirrored: r.mirrored,
           swapped: r.swapped,
           route: r.route,
+          reason: r.reason ?? "",
           via: via.get(v.id) ?? [],
           wire: v.wire,
         });
@@ -1009,10 +1082,12 @@ export class ShardStore {
    * every copy comparator 42 does (PAPH-X 1.1.1–1.2.0, synthetic and chain corpora); a rejected
    * candidate (state −1) is not a verdict.
    */
-  private rank(sideFor: (wire: number) => XSide | null, batch: Nom[], policy: Policy, out: Map<number, Verified>, stats: ShardStats): void {
+  private rank(sideFor: (wire: number) => XSide | null, batch: Nom[], policy: Policy, out: Map<number, Verified>, stats: ShardStats, refresh = false): void {
     if (!batch.length) return;
     const { engine, x } = this.rt;
     const groups = new Map<number, { query: XSide; sides: XSide[]; order: Array<{ id: number; hash: string }> }>();
+    // sides derived from their wires, whose sidecar a background check stores afterwards
+    const derived: Array<{ id: number; hash: string; side: XSide }> = [];
     try {
       for (const r of this.sql.exec(SQL.loadWires, JSON.stringify(batch.map((n) => n.id))).toArray()) {
         // stored wires came from this engine's hasher; one it can no longer read is skipped, not fatal
@@ -1022,7 +1097,15 @@ export class ShardStore {
           if (wireFormat(t1) !== wire) throw new Error("wire version");
           const query = sideFor(wire);
           if (!query) throw new Error("wire version");
-          const side = engine.xprepare(t1, asBytes(r.t2), { strict: true, profile: x });
+          // through the stored sidecar when it names this profile and format: the engine reads it
+          // instead of deriving the side (and derives it anyway, saying so, if it does not match)
+          const sc = this.keepSidecars && String(r.sidecar_id ?? "") === this.rt.identity.sidecar ? asBytes(r.sidecar) : null;
+          const side = engine.xprepare(t1, asBytes(r.t2), { strict: true, profile: x, ...(sc ? { sidecar: sc } : {}) });
+          if (side.sidecarState === "used") stats.sidecars.read++;
+          else {
+            stats.sidecars.derived++;
+            if (refresh && wire === WIRE_VERSION) derived.push({ id: Number(r.post_id), hash: String(r.content_hash), side });
+          }
           let g = groups.get(wire);
           if (!g) groups.set(wire, (g = { query, sides: [], order: [] }));
           g.sides.push(side);
@@ -1036,9 +1119,53 @@ export class ShardStore {
         stats.verified += recs.length;
         recs.forEach((rec, i) => out.set(g.order[i].id, { id: g.order[i].id, contentHash: g.order[i].hash, rec, wire }));
       }
+      for (const d of derived) if (this.storeSidecar(d.id, d.hash, d.side)) stats.sidecars.stored++;
     } finally {
       for (const g of groups.values()) for (const s of g.sides) s.free();
     }
+  }
+
+  /**
+   * Store a current sidecar for works that have none, or one derived under another X profile or
+   * sidecar format (after a release: `rederive` re-puts every work, and stores them; this sweep
+   * catches the rest — works put while the shard had no room, or with sidecars off), in
+   * background slices, `limit` at most. Works on another wire format are left to their re-hash
+   * (which stores one), and a work whose wires the engine refuses is marked for re-hashing, as
+   * `rederive` marks it, so neither is selected again. `remaining`: works on the current wires and
+   * derivation still without a current sidecar; `room`: whether the shard may store more.
+   */
+  refreshSidecars(limit = 200): Promise<{ stored: number; remaining: number; room: boolean }> {
+    return this.background(async (slice) => {
+      const { engine, x } = this.rt;
+      let stored = 0;
+      if (this.keepSidecars && this.sidecarRoom()) {
+        const rows = this.sql.exec(SWEEP.staleSidecars, this.rt.derivation, this.rt.identity.sidecar, WIRE_VERSION, limit).toArray();
+        for (let i = 0; i < rows.length; i++) {
+          if (i && i % 10 === 0) await slice();
+          const id = Number(rows[i].post_id);
+          const w = this.wires(id);
+          if (!w || w.contentHash !== String(rows[i].content_hash)) continue; // replaced or removed meanwhile
+          let side: XSide | null = null;
+          try {
+            if (wireFormat(w.t1) !== WIRE_VERSION) throw new Error("wire version"); // its column and bytes disagree
+            side = engine.xprepare(w.t1, w.t2 ?? null, { strict: true, profile: x });
+          } catch (e) {
+            if (!wireRefused(e)) throw e;
+            // the stage computes its wires again from the image, and its sidecar comes with them
+            this.sql.exec("UPDATE works SET derivation = 'rehash' WHERE post_id = ?", id).toArray();
+            continue;
+          }
+          try {
+            if (!this.storeSidecar(id, w.contentHash, side)) break;
+            stored++;
+          } finally {
+            side.free();
+          }
+        }
+      }
+      const left = this.sql.exec(SWEEP.staleSidecarCount, this.rt.derivation, this.rt.identity.sidecar, WIRE_VERSION).toArray()[0];
+      return { stored, remaining: Number(left?.n ?? 0), room: this.keepSidecars && this.sidecarRoom() };
+    });
   }
 
   /** The shard's state from running counts and one pass over the small columns of `works` — none over the postings. */
@@ -1053,6 +1180,8 @@ export class ShardStore {
     derivation: string;
     identity: string;
     si: string | null;
+    /** sidecars kept at all, whether there is room for more, stored, current (this X profile and format) */
+    sidecars: { kept: boolean; room: boolean; stored: number; current: number; format: string };
     postings: Record<string, number>;
     queued: Record<Lane, number>;
   } {
@@ -1067,6 +1196,8 @@ export class ShardStore {
     const wires: Record<string, number> = {};
     for (const r of this.sql.exec("SELECT wire, COUNT(*) AS n FROM works GROUP BY wire").toArray()) wires[String(r.wire)] = Number(r.n);
     const works = Number(w?.n ?? 0), current = Number(w?.cur ?? 0), rehash = Number(w?.bad ?? 0);
+    // sidecars stored, and those derived under the current X profile and format (the small columns: no block read)
+    const sc = this.sql.exec("SELECT COUNT(*) AS n, SUM(sidecar_id = ?1) AS cur FROM sidecars", this.rt.identity.sidecar).toArray()[0];
     return {
       works,
       current,
@@ -1077,6 +1208,7 @@ export class ShardStore {
       derivation: this.rt.derivation,
       identity: this.rt.identity.id,
       si: this.rt.si ? this.rt.identity.siprofileId : null,
+      sidecars: { kept: this.keepSidecars, room: this.keepSidecars && this.sidecarRoom(), stored: Number(sc?.n ?? 0), current: Number(sc?.cur ?? 0), format: this.rt.identity.sidecar },
       postings,
       queued: this.turns.queued,
     };

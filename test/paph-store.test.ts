@@ -599,6 +599,114 @@ describe("a shard", () => {
     expect(await store.rederive()).toMatchObject({ rederived: 1, rehash: 0, remaining: 0 });
   });
 
+  // ---- @pixagram/paph-x 1.3.0: PAX1 sidecars and reasons -------------------------------------
+
+  const cut = (r: { matches: Array<Record<string, unknown>> }) => r.matches.map(({ route: _r, ...m }) => m);
+
+  it("keeps each work's sidecar and verifies through it, reaching the same verdicts as from the wires", async () => {
+    const withSc = corpus();
+    const without = corpus({ sidecars: false });
+    const works = 2 + distractors.length;
+    expect(withSc.store.stats().sidecars).toMatchObject({ kept: true, room: true, stored: works, current: works, format: rt.identity.sidecar });
+    expect(without.store.stats().sidecars).toMatchObject({ kept: false, stored: 0 });
+    expect(rt.identity.sidecar).toMatch(/^x:8af84dd0abb12192 pax3$/);
+    for (const im of [mirror(small), crop(small, 10, 13, 86, 107), paste(small, second, 60, 45)]) {
+      const q = wires(await fingerprint(im));
+      const a = await withSc.store.find(q, { budget: budget() });
+      const b = await without.store.find(q, { budget: budget() });
+      // every candidate read through its sidecar, none derived
+      expect(a.stats.sidecars.read).toBe(a.stats.verified);
+      expect(a.stats.sidecars.derived).toBe(0);
+      expect(b.stats.sidecars).toEqual({ read: 0, derived: b.stats.verified, stored: 0 });
+      // and the same verdicts, records and pairs examined
+      expect(cut(a as any)).toEqual(cut(b as any));
+      expect(a.checked).toEqual(b.checked);
+    }
+  });
+
+  it("does not read a sidecar of another profile or format; a background check stores a current one, an interactive one does not", async () => {
+    const { store, db } = corpus();
+    db.prepare("UPDATE sidecars SET sidecar_id = 'x:27993afaaca76d11 pax2'").run();
+    expect(store.stats().sidecars.current).toBe(0);
+    const q = wires(await fingerprint(mirror(small)));
+    const i1 = await store.find(q, { budget: budget() });
+    expect([i1.stats.sidecars.read, i1.stats.sidecars.stored]).toEqual([0, 0]);
+    expect(i1.stats.sidecars.derived).toBe(i1.stats.verified);
+    const bg = await store.find(q, { budget: budget(), priority: "background" });
+    expect(bg.stats.sidecars.stored).toBe(bg.stats.verified);
+    const i2 = await store.find(q, { budget: budget() });
+    expect(i2.stats.sidecars.read).toBe(i2.stats.verified);
+    expect(cut(i2 as any)).toEqual(cut(i1 as any));
+    // a damaged block under the current name is refused by the engine, the side derived, the verdicts the same
+    db.prepare("UPDATE sidecars SET bytes = substr(bytes, 1, 100)").run();
+    const i3 = await store.find(q, { budget: budget() });
+    expect(i3.stats.sidecars.read).toBe(0);
+    expect(cut(i3 as any)).toEqual(cut(i1 as any));
+  });
+
+  it("stores no sidecar without room, verifies from the wires, and fills the missing ones once there is room", async () => {
+    let room = false;
+    const { store, sql, transact } = corpus({ sidecarRoom: () => room });
+    expect(store.stats().sidecars).toMatchObject({ stored: 0, room: false });
+    const r = await store.find(wires(await fingerprint(mirror(small))), { budget: budget(), priority: "background" });
+    expect(r.matches.find((m) => m.id === 1)?.state).toBeGreaterThanOrEqual(STATE.Copy);
+    expect(r.stats.sidecars.stored).toBe(0);
+    expect(await store.refreshSidecars(10)).toMatchObject({ stored: 0, room: false });
+    room = true;
+    const first = await store.refreshSidecars(10);
+    expect(first).toEqual({ stored: 10, remaining: 2 + distractors.length - 10, room: true });
+    const rest = await store.refreshSidecars(1000);
+    expect(rest).toEqual({ stored: 2 + distractors.length - 10, remaining: 0, room: true });
+    expect(store.stats().sidecars.current).toBe(2 + distractors.length);
+    // another store over the same database, with sidecars off, reads none
+    const off = new ShardStore(sql, transact, rt, { sidecars: false });
+    expect(await off.refreshSidecars(10)).toMatchObject({ stored: 0, room: false });
+  });
+
+  it("sweeps past the works it cannot store a sidecar for: another wire format waits for its re-hash, refused wires are sent to it", async () => {
+    let room = false;
+    const { store, db } = corpus({ sidecarRoom: () => room });
+    const total = 2 + distractors.length;
+    // the lowest post ids: one entry still on wire 3, one whose wires the engine refuses
+    store.put({ postId: 1, contentHash: "h1", ...wires(await fingerprint(small, DEFAULT_MAX_PIXELS, 3)) });
+    db.prepare("UPDATE works SET t1 = substr(t1, 1, 100) WHERE post_id = 2").run();
+    room = true;
+    // neither is selected again and again ahead of the others: one call takes the refused one
+    // out, the next stores the rest
+    expect(await store.refreshSidecars(1)).toEqual({ stored: 0, remaining: total - 2, room: true });
+    expect(store.info(2)!.derivation).toBe("rehash");
+    expect(await store.refreshSidecars(1)).toEqual({ stored: 1, remaining: total - 3, room: true });
+    expect(await store.refreshSidecars(1000)).toEqual({ stored: total - 3, remaining: 0, room: true });
+    expect(count(db, "SELECT COUNT(*) AS n FROM sidecars WHERE post_id IN (1, 2)")).toBe(0);
+  });
+
+  it("drops a work's sidecar with the work, and replaces it with a new image's", async () => {
+    const { store, db } = corpus();
+    const sc = () => db.prepare("SELECT content_hash AS h, length(bytes) AS n FROM sidecars WHERE post_id = 1").get() as { h: string; n: number } | undefined;
+    expect(sc()?.h).toBe("h1");
+    expect(sc()!.n).toBeGreaterThan(20_000);
+    store.put({ postId: 1, contentHash: "h1b", t1: fpSecond.t1, t2: fpSecond.t2 });
+    expect(sc()?.h).toBe("h1b");
+    expect(store.remove(1)).toBe(true);
+    expect(sc()).toBeUndefined();
+    // a sidecar is stored only beside the image its entry shows
+    db.prepare(SQL.putSidecar).run(2, "not-h2", rt.identity.sidecar, new Uint8Array(8));
+    expect((db.prepare("SELECT content_hash AS h FROM sidecars WHERE post_id = 2").get() as { h: string }).h).toBe("h2");
+  });
+
+  it("says how each verdict was reached, and why a fallback deferred", async () => {
+    const { store } = corpus();
+    const known = new Set(["route", "identical", "exact-evidence", "bounded-evidence", "BELOW_SUSPECTED", "pool-truncated", "control-saturated", "uncertified-geometry", "certificate-unreachable", "exact"]);
+    for (const im of [mirror(small), upscale(small, 2), swapRedBlue(small)]) {
+      const r = await store.find(wires(await fingerprint(im)), { budget: budget() });
+      const hit = r.matches.find((m) => m.id === 1)!;
+      expect(hit.state).toBeGreaterThanOrEqual(STATE.Copy);
+      expect(known.has(hit.reason), hit.reason).toBe(true);
+      if (hit.execution === "FALLBACK") expect(hit.reason).toMatch(/uncertified-geometry|certificate-unreachable|control-saturated|pool-truncated/);
+      else expect(hit.reason).toMatch(/exact-evidence|bounded-evidence|route|identical/);
+    }
+  });
+
   it("runs every statement of a check and of an index write on the primary keys", () => {
     const { db } = corpus();
     const keys = JSON.stringify({ c: [1, 2, 3], b: [4, 5], s: [6] });
@@ -615,13 +723,14 @@ describe("a shard", () => {
       reachSi: [JSON.stringify([[6, 2]]), "[]"],
       loadSigs: ["[1, 2]", "d"],
       loadWires: ["[1, 2]"],
+      putSidecar: [1, "h", "x:0 pax3", new Uint8Array(4)],
       legacy: [4],
     };
     // every statement is held to it
     expect(Object.keys(plans).sort()).toEqual(Object.keys(SQL).sort());
     for (const [name, args] of Object.entries(plans)) {
       const plan = (db.prepare(`EXPLAIN QUERY PLAN ${(SQL as Record<string, string>)[name]}`).all(...(args as any[])) as Array<{ detail: string }>).map((r) => r.detail);
-      const scans = plan.filter((d) => /^SCAN (postings|df|works|meta|p|d)\b/.test(d));
+      const scans = plan.filter((d) => /^SCAN (postings|df|works|meta|sidecars|p|d|s|w)\b/.test(d));
       expect(scans, `${name}: ${plan.join(" | ")}`).toEqual([]);
     }
   });

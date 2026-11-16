@@ -34,7 +34,6 @@ case "${1:-help}" in
   reindex-author)   curl "${H[@]}" -X POST "$BASE/admin/reindex" -d "{\"author\":\"${2:?author}\",\"stages\":$(stages_json "${3:-}"),\"force\":$(bool_json "${4:-}")}" ;;
   reindex-post)     curl "${H[@]}" -X POST "$BASE/admin/reindex" -d "{\"post_id\":${2:?post id},\"stages\":$(stages_json "${3:-}"),\"force\":true}" ;;
   sweep)            curl "${H[@]}" -X POST "$BASE/admin/sweep?max=${2:-200}" ;;
-  reconcile)        curl "${H[@]}" -X POST "$BASE/admin/reconcile?hours=${2:-48}&max_ingest=${3:-100}" ;;   # reconcile [hours] [max_ingest]: ingest what Hivemind lists and the index lacks (repeat while truncated)
   background)       curl "${H[@]}" -X POST "$BASE/admin/background" ;;
   vocab-rebuild)    curl "${H[@]}" -X POST "$BASE/admin/vocab/rebuild" ;;
   failed)           curl "${H[@]}" "$BASE/admin/jobs/failed" ;;
@@ -55,6 +54,7 @@ case "${1:-help}" in
   paph-purge-stale) curl "${H[@]}" -X POST "$BASE/admin/paph/stale?purge=1" ;;                 # refused while artworks await their re-check
   paph-gc)          curl "${H[@]}" -X POST "$BASE/admin/paph/gc?limit=${2:-500}" ;;            # works of deleted posts leave the shards (and stale entries lose their mark)
   paph-heal)        curl "${H[@]}" -X POST "$BASE/admin/paph/heal?limit=${2:-100}" ;;          # verdicts reached on wire 3 that no re-check will replace: compared again
+  paph-sidecars)    curl "${H[@]}" -X POST "$BASE/admin/paph/sidecars?limit=${2:-200}" ;;     # PAX1 sidecars the shards lack (1.3.0): repeat until remaining is 0
   copies)           curl "${H[@]}" "$BASE/copies/${2:?post id}?min=${3:-copy}" ;;              # stored verdicts of an artwork
   copies-live)      curl "${H[@]}" "$BASE/copies/${2:?post id}?min=${3:-copy}&live=1" ;;       # checked again now, in every shard
   copies-image)     command curl -sS -F "image=@${2:?image file}" "$BASE/copies-by-image?min=${3:-copy}" ;;  # an upload (sub-second; cached a day)
@@ -74,8 +74,9 @@ usage: scripts/admin.sh <command> [args]
   reindex-all [stages] [force] | reindex-author <author> [stages] [force] | reindex-post <id> [stages]
       stages: comma list of stats,paph,embed,describe,concepts,text (default: all)
   paph | paph-alerts [days] | paph-rederive [limit] | paph-stale | paph-purge-stale | paph-gc [limit] | paph-heal [limit]   copy detection
+  paph-sidecars [limit]                                              PAX1 sidecars the shards lack
   copies <id> [min] | copies-live <id> [min] | copies-image <file> [min]             copies of a work / an image
-  sweep [max] | reconcile [hours] [max_ingest] | background | vocab-rebuild | failed | queries [days]
+  sweep [max] | background | vocab-rebuild | failed | queries [days]
   weights | weights-set <file.json> | ltr-export [days] | describe <id> [backend]
   docs | docs-sync [force] | docs-reembed | docs-gaps [days]       the documentation behind /help
   docs-retrieve "<question>" [k]                                    its retrieval alone (cosines, for DOCS_MIN_SCORE)
