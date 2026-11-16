@@ -212,6 +212,7 @@
     "PAPH_PHASH_DISTANCE": "10",
     "PAPH_CHANNEL_K": "24"
   },
+  "limits": { "cpu_ms": 300000, "subrequests": 1000000 },
   // Per client IP (and Cloudflare location): search-like routes / /ask, /help and /search-by-image /
   // /suggest (one request per pause in typing, several people behind one address). Namespaces of
   // their own (41xx; v3 has 31xx), so the two stacks do not share budgets. The admin token is exempt.
