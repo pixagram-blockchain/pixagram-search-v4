@@ -34,6 +34,7 @@ case "${1:-help}" in
   reindex-author)   curl "${H[@]}" -X POST "$BASE/admin/reindex" -d "{\"author\":\"${2:?author}\",\"stages\":$(stages_json "${3:-}"),\"force\":$(bool_json "${4:-}")}" ;;
   reindex-post)     curl "${H[@]}" -X POST "$BASE/admin/reindex" -d "{\"post_id\":${2:?post id},\"stages\":$(stages_json "${3:-}"),\"force\":true}" ;;
   sweep)            curl "${H[@]}" -X POST "$BASE/admin/sweep?max=${2:-200}" ;;
+  reconcile)        curl "${H[@]}" -X POST "$BASE/admin/reconcile?hours=${2:-48}&max_ingest=${3:-100}" ;;   # reconcile [hours] [max_ingest]: ingest what Hivemind lists and the index lacks (repeat while truncated)
   background)       curl "${H[@]}" -X POST "$BASE/admin/background" ;;
   vocab-rebuild)    curl "${H[@]}" -X POST "$BASE/admin/vocab/rebuild" ;;
   failed)           curl "${H[@]}" "$BASE/admin/jobs/failed" ;;
@@ -74,7 +75,7 @@ usage: scripts/admin.sh <command> [args]
       stages: comma list of stats,paph,embed,describe,concepts,text (default: all)
   paph | paph-alerts [days] | paph-rederive [limit] | paph-stale | paph-purge-stale | paph-gc [limit] | paph-heal [limit]   copy detection
   copies <id> [min] | copies-live <id> [min] | copies-image <file> [min]             copies of a work / an image
-  sweep [max] | background | vocab-rebuild | failed | queries [days]
+  sweep [max] | reconcile [hours] [max_ingest] | background | vocab-rebuild | failed | queries [days]
   weights | weights-set <file.json> | ltr-export [days] | describe <id> [backend]
   docs | docs-sync [force] | docs-reembed | docs-gaps [days]       the documentation behind /help
   docs-retrieve "<question>" [k]                                    its retrieval alone (cosines, for DOCS_MIN_SCORE)

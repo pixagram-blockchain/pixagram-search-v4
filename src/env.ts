@@ -73,6 +73,14 @@ export interface Env {
   TAIL_IDLE_SECONDS?: string;
   /** failed ticks in a row on the same post before the tail sets that post aside (default 6, about a minute) */
   TAIL_PARK_AFTER?: string;
+  /** v4.8.3: hours the tail keeps asking Hivemind for a post it has not caught up with (default 24) */
+  TAIL_DEFER_HOURS?: string;
+  /** v4.8.3: deferred posts asked again per tick (default 10) */
+  TAIL_DEFER_PER_TICK?: string;
+  /** v4.8.3: window of the ten-minute reconciliation with Hivemind's newest posts, in hours (default 3; 0 = off) */
+  RECONCILE_HOURS?: string;
+  /** v4.8.3: window of the nightly reconciliation, in hours (default 48; 0 = off) */
+  RECONCILE_DEEP_HOURS?: string;
   /** Walk each account's comment history during the backfill (post_versions). Default "true". */
   HISTORY_BACKFILL?: string;
   /** Max account_history calls per account in one backfill step (each scans ≤ 2000 ops). Default 300. */
