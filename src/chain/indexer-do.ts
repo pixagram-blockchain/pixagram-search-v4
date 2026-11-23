@@ -17,11 +17,21 @@
 // Hivemind must show once it has processed it (its `last_update`, see OpRef.prevAt); a post it
 // has not caught up with is "deferred" and asked again on the next ticks, with backoff, for up to
 // TAIL_DEFER_HOURS. src/chain/reconcile.ts is the safety net behind it.
+//
+// v4.8.4: from 18 Nov 13:24 to 19 Nov 12:32 UTC (2026) no post reached the index, and none came
+// back: what fits is the primary node's Hivemind stalled while answering "does not exist". Every
+// node runs a Hivemind of its own, so the retries of a deferred (and of a parked) post now ask
+// the next node first. And nothing but an explicit stop() halts the tail: a step of a tick other
+// than a post's ingestion (the edit history, marketplace ops) that keeps failing on the same
+// blocks is skipped after TAIL_STEP_SKIP_AFTER ticks, logged and listed in status() (parking
+// covered posts only, so such a step held the cursor for good); a block range that cannot be read
+// is read in smaller pieces; and the ten-minute watchdog starts a tail that was never started and
+// re-arms one whose alarm is gone or which has not ticked for a quarter of an hour.
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { int, num } from "../env";
-import { chainTime, normalizeOp, type ChainRpc, type CommentOp, type CondenserPost, type CustomJsonOp } from "./rpc";
+import { chainTime, normalizeOp, type Block, type ChainRpc, type CommentOp, type CondenserPost, type CustomJsonOp } from "./rpc";
 import { ingestPost, rpcFor, type IngestOutcome } from "./ingest";
 import { handleMarketOp, marketIds } from "./market";
 import { artworksWithHashes, refreshImageHistory, relabelKinds, versionsFromBlocks, writeVersions } from "./versions";
@@ -61,6 +71,8 @@ export interface ParkedPost extends PostRef {
 export interface DeferredPost extends OpRef {
   /** what Hivemind answered last */
   why: string;
+  /** v4.8.4: the node that answered last (each retry asks the next node first) */
+  node?: string | null;
   /** when it was first deferred, last tried and is due again (milliseconds) */
   since: number;
   lastTryAt: number;
@@ -88,6 +100,28 @@ interface IndexerState {
   /** posts deferred so far (Hivemind behind), and those of them given up on */
   deferredTotal: number;
   deferredGivenUp: number;
+  /** v4.8.4: when stop() was called (null: never, or started since); the watchdog leaves a stopped tail alone */
+  stoppedAt: number | null;
+  /** v4.8.4: the step other than a post's ingestion that the last failed ticks stopped on, and how many ticks in a row */
+  stuckStep: { step: TickStep; cursor: number; ticks: number; error: string } | null;
+  /** v4.8.4: steps skipped after failing TAIL_STEP_SKIP_AFTER ticks in a row (the last SKIPPED_MAX), and how many in all */
+  skipped: SkippedStep[];
+  skippedTotal: number;
+  /** v4.8.4: block ranges are read 2^readShrink times smaller after reads that failed (0: TAIL_BLOCKS_PER_TICK) */
+  readShrink: number;
+  /** successful reads since readShrink last changed */
+  readOk: number;
+}
+
+/** The steps of a tick that are not a post's ingestion (which parking covers). */
+export type TickStep = "versions" | "market";
+
+export interface SkippedStep {
+  step: TickStep;
+  from: number;
+  to: number;
+  error: string;
+  at: number;
 }
 
 const DEFAULT_STATE: IndexerState = {
@@ -106,7 +140,24 @@ const DEFAULT_STATE: IndexerState = {
   stuck: null,
   deferredTotal: 0,
   deferredGivenUp: 0,
+  stoppedAt: null,
+  stuckStep: null,
+  skipped: [],
+  skippedTotal: 0,
+  readShrink: 0,
+  readOk: 0,
 };
+
+/** Failed ticks in a row on one step of the same blocks before that step is skipped for them (about a minute). */
+const STEP_SKIP_AFTER = 6;
+/** Skipped steps listed in the state (the newest). */
+const SKIPPED_MAX = 20;
+/** Smallest read: TAIL_BLOCKS_PER_TICK / 2^7 (100 → 1 block). */
+const READ_SHRINK_MAX = 7;
+/** Successful reads before a shrunk range doubles again. */
+const READ_GROW_AFTER = 20;
+/** The watchdog re-arms a running tail that has not ticked for this long, alarm or not. */
+export const STALL_MS = 15 * 60_000;
 
 /** Failed ticks in a row on one post before it is parked: about a minute (a failed tick re-arms in 10 s). */
 const PARK_AFTER = 6;
@@ -147,8 +198,8 @@ export type OpOutcome =
   | { kind: "ingested"; r: IngestOutcome }
   /** deleted on chain: marked deleted if it is in the index */
   | { kind: "gone" }
-  /** Hivemind has not processed the op yet; `stale` is the older state it does show, if any */
-  | { kind: "deferred"; why: string; stale: CondenserPost | null };
+  /** Hivemind has not processed the op yet; `stale` is the older state it does show, if any; `node` the node asked */
+  | { kind: "deferred"; why: string; stale: CondenserPost | null; node?: string | null };
 
 async function markDeleted(env: Env, ref: { author: string; permlink: string }): Promise<void> {
   // delete_comment on a post without votes really removes it from state.
@@ -161,18 +212,20 @@ async function markDeleted(env: Env, ref: { author: string; permlink: string }):
  * or any absence after a delete_comment, is final. A state older than the op is Hivemind behind
  * on an edit (or on the delete), unless prevAt is 0.
  */
-export async function ingestOp(env: Env, ref: OpRef, reason: string, rpc: ChainRpc = rpcFor(env)): Promise<OpOutcome> {
-  const s = await rpc.getContentState(ref.author, ref.permlink);
+export async function ingestOp(env: Env, ref: OpRef, reason: string, rpc: ChainRpc = rpcFor(env), o: { node?: number } = {}): Promise<OpOutcome> {
+  // v4.8.4: `node` asks the node-th configured node first (a retry of a deferred or parked post):
+  // every node runs a Hivemind of its own, and one that has stalled must not hold a post back
+  const s = await rpc.getContentState(ref.author, ref.permlink, o.node === undefined ? {} : { from: o.node });
   if ("absent" in s) {
     if (ref.op === "delete" || s.absent === "deleted") {
       await markDeleted(env, ref);
       return { kind: "gone" };
     }
-    return { kind: "deferred", why: "Hivemind does not hold it yet", stale: null };
+    return { kind: "deferred", why: "Hivemind does not hold it yet", stale: null, node: rpc.lastNode };
   }
   const t = hivemindTime(s.post);
   if (ref.prevAt > 0 && t > 0 && t < ref.prevAt) {
-    return { kind: "deferred", why: `Hivemind shows the state of ${iso(t)}, the op needs ${iso(ref.prevAt)}`, stale: s.post };
+    return { kind: "deferred", why: `Hivemind shows the state of ${iso(t)}, the op needs ${iso(ref.prevAt)}`, stale: s.post, node: rpc.lastNode };
   }
   return { kind: "ingested", r: await ingestPost(env, s.post, ref.block, reason) };
 }
@@ -237,10 +290,12 @@ export class ChainIndexer extends DurableObject<Env> {
     if (!batch.length) return { retried: 0, ingested: 0, left: 0 };
     const done = new Set<string>();
     const failed = new Map<string, { error: string; at: number }>();
+    const rpc = rpcFor(this.env);
     for (const p of batch) {
       try {
-        // any state Hivemind shows will do (prevAt 0): the post has waited long enough
-        const out = await ingestOp(this.env, { author: p.author, permlink: p.permlink, block: p.block, op: p.op ?? "delete", prevAt: 0 }, "parked");
+        // any state Hivemind shows will do (prevAt 0): the post has waited long enough. Each try
+        // starts with another node (v4.8.4): the one the tail kept failing on was the preferred one.
+        const out = await ingestOp(this.env, { author: p.author, permlink: p.permlink, block: p.block, op: p.op ?? "delete", prevAt: 0 }, "parked", rpc, { node: p.attempts + 1 });
         if (out.kind === "deferred") failed.set(refKey(p), { error: out.why, at: Date.now() });
         else done.add(refKey(p));
       } catch (e) {
@@ -269,8 +324,12 @@ export class ChainIndexer extends DurableObject<Env> {
       s.cursor = dgp.last_irreversible_block_num;
     }
     s.running = true;
+    s.stoppedAt = null;
     s.lastError = null;
     s.stuck = null;
+    s.stuckStep = null;
+    s.readShrink = 0;
+    s.readOk = 0;
     s.epoch++;
     await this.save(s);
     await this.ctx.storage.setAlarm(Date.now() + 10);
@@ -280,21 +339,40 @@ export class ChainIndexer extends DurableObject<Env> {
   async stop(): Promise<IndexerState> {
     const s = await this.load();
     s.running = false;
+    s.stoppedAt = Date.now();
     s.epoch++;
     await this.save(s);
     await this.ctx.storage.deleteAlarm();
     return s;
   }
 
-  /** Watchdog: if running but the alarm is gone (it happens after failed deploys), re-arm it. */
+  /** Watchdog (before v4.8.4): if running but the alarm is gone, re-arm it. Kept for callers of the old name. */
   async ensureAlarm(): Promise<boolean> {
+    return (await this.watchdog()).action !== "none";
+  }
+
+  /**
+   * The ten-minute watchdog. A tail that was never started (a fresh deployment: no cursor, no
+   * stop) is started at the irreversible head; one stopped by stop() is left alone (/healthz says
+   * so). A running tail whose alarm is gone (it happens after failed deploys, or once an alarm
+   * exhausted its retries) or that has not ticked for STALL_MS is re-armed. A tick in progress is
+   * not disturbed: it sets its own alarm when it ends, and alarm handlers never overlap.
+   */
+  async watchdog(): Promise<{ action: "none" | "started" | "rearmed"; why?: string }> {
     const s = await this.load();
-    if (!s.running) return false;
-    if ((await this.ctx.storage.getAlarm()) === null) {
-      await this.ctx.storage.setAlarm(Date.now() + 10);
-      return true;
+    if (!s.running) {
+      if (s.cursor !== null || s.stoppedAt !== null) return { action: "none" };
+      await this.start();
+      return { action: "started", why: "never started" };
     }
-    return false;
+    const alarm = await this.ctx.storage.getAlarm();
+    const since = Date.now() - (s.lastTickAt ?? 0);
+    if (alarm === null || since > STALL_MS) {
+      const why = alarm === null ? "no alarm" : `no tick for ${Math.round(since / 60_000)} min (alarm at ${new Date(alarm).toISOString()})`;
+      await this.ctx.storage.setAlarm(Date.now() + 10);
+      return { action: "rearmed", why };
+    }
+    return { action: "none" };
   }
 
   // ---- the loop ---------------------------------------------------------------------
@@ -307,7 +385,10 @@ export class ChainIndexer extends DurableObject<Env> {
   private async commit(s: IndexerState, epoch: number, nextAlarmMs: number): Promise<void> {
     const cur = await this.load();
     if (cur.epoch !== epoch) {
-      await this.save({ ...cur, ticks: s.ticks, postsSeen: s.postsSeen, lib: s.lib, head: s.head, lastTickAt: s.lastTickAt, deferredTotal: s.deferredTotal, deferredGivenUp: s.deferredGivenUp });
+      await this.save({
+        ...cur, ticks: s.ticks, postsSeen: s.postsSeen, lib: s.lib, head: s.head, lastTickAt: s.lastTickAt,
+        deferredTotal: s.deferredTotal, deferredGivenUp: s.deferredGivenUp, skipped: s.skipped, skippedTotal: s.skippedTotal,
+      });
       return;
     }
     await this.save(s);
@@ -343,10 +424,12 @@ export class ChainIndexer extends DurableObject<Env> {
     let gaveUp = 0;
     if (!due.length) return { tried: 0, gaveUp };
     const maxAgeMs = Math.max(0, num(this.env.TAIL_DEFER_HOURS, DEFER_HOURS)) * 3_600_000;
+    const rpc = rpcFor(this.env);
     for (const d of due) {
       const key = refKey(d);
       try {
-        const out = await ingestOp(this.env, d, "tail-deferred");
+        // the n-th retry asks the n-th node first (the first ask went to the preferred one)
+        const out = await ingestOp(this.env, d, "tail-deferred", rpc, { node: d.tries });
         if (out.kind !== "deferred") {
           m.delete(key);
           if (t - d.since > 60_000) console.log("indexer: Hivemind caught up with a deferred post", key, "block", d.block, `after ${Math.round((t - d.since) / 1000)} s`);
@@ -363,7 +446,7 @@ export class ChainIndexer extends DurableObject<Env> {
           gaveUp++;
           continue;
         }
-        m.set(key, { ...d, why: out.why.slice(0, WHY_MAX), tries: d.tries + 1, lastTryAt: t, nextAt: t + deferBackoffMs(d.tries + 1) });
+        m.set(key, { ...d, why: out.why.slice(0, WHY_MAX), node: out.node ?? null, tries: d.tries + 1, lastTryAt: t, nextAt: t + deferBackoffMs(d.tries + 1) });
       } catch (e) {
         m.set(key, { ...d, why: errorText(e).slice(0, WHY_MAX), tries: d.tries + 1, lastTryAt: t, nextAt: t + deferBackoffMs(d.tries + 1) });
       }
@@ -399,8 +482,26 @@ export class ChainIndexer extends DurableObject<Env> {
         return;
       }
 
-      const count = Math.min(perTick, s.lib - s.cursor + 1);
-      const blocks = await rpc.getBlockRange(s.cursor, count);
+      // A range that could not be read is read in smaller pieces (a node timing out on a large
+      // reply); it grows back after READ_GROW_AFTER good reads.
+      const count = Math.min(Math.max(1, perTick >> s.readShrink), s.lib - s.cursor + 1);
+      let blocks: Block[];
+      try {
+        blocks = await rpc.getBlockRange(s.cursor, count);
+      } catch (e) {
+        s.readShrink = Math.min(READ_SHRINK_MAX, s.readShrink + 1);
+        s.readOk = 0;
+        throw e;
+      }
+      if (s.readShrink > 0 && ++s.readOk >= READ_GROW_AFTER) {
+        s.readShrink--;
+        s.readOk = 0;
+      }
+      if (!blocks.length) {
+        // a node behind the one that gave the irreversible head: nothing to read yet, wait as when idle
+        await this.commit(s, epoch, idleMs);
+        return;
+      }
       const times = blocks.map((b) => chainTime(b.timestamp));
       let before: number | null = null;
       const prevAt = async (i: number): Promise<number> => (i > 0 ? times[i - 1] : (before ??= await this.timeBefore(s, rpc, times[0])));
@@ -467,7 +568,7 @@ export class ChainIndexer extends DurableObject<Env> {
           const t = Date.now();
           const was = deferred.get(key);
           if (!was) newlyDeferred++;
-          deferred.set(key, { ...ref, why: out.why.slice(0, WHY_MAX), since: was?.since ?? t, lastTryAt: t, nextAt: t + deferBackoffMs(1), tries: (was?.tries ?? 0) + 1 });
+          deferred.set(key, { ...ref, why: out.why.slice(0, WHY_MAX), node: out.node ?? null, since: was?.since ?? t, lastTryAt: t, nextAt: t + deferBackoffMs(1), tries: (was?.tries ?? 0) + 1 });
           deferredChanged = true;
           tracked.add(key);
         } else {
@@ -476,17 +577,45 @@ export class ChainIndexer extends DurableObject<Env> {
         }
         s.postsSeen++;
       }
+      s.stuck = null; // every post of the range is done with (ingested, deferred or parked)
       if (deferred.size > deferredBefore) console.warn("indexer deferred posts Hivemind does not show yet", deferred.size - deferredBefore, "waiting:", deferred.size);
+
+      // The other steps of the tick: a failure is retried with the tick, as any failure is, but after
+      // `stepSkipAfter` ticks in a row failing on the same step of the same blocks, that step is
+      // skipped for them (logged, listed in status().skipped) and the tail moves on. The posts are in
+      // already; what is lost is their exact edit history for these blocks (the snapshot remains).
+      const stepSkipAfter = Math.max(1, int(this.env.TAIL_STEP_SKIP_AFTER, STEP_SKIP_AFTER));
+      const first = s.cursor;
+      const runStep = async (step: TickStep, fn: () => Promise<void>): Promise<void> => {
+        try {
+          await fn();
+        } catch (e) {
+          const error = errorText(e);
+          const ticks = s.stuckStep?.step === step && s.stuckStep.cursor === first ? s.stuckStep.ticks + 1 : 1;
+          if (ticks < stepSkipAfter) {
+            s.stuckStep = { step, cursor: first, ticks, error };
+            throw e;
+          }
+          s.stuckStep = null;
+          s.skipped = [...(s.skipped ?? []), { step, from: first, to: first + blocks.length - 1, error, at: Date.now() }].slice(-SKIPPED_MAX);
+          s.skippedTotal = (s.skippedTotal ?? 0) + 1;
+          console.error(`indexer skipped the ${step} step of blocks ${first}-${first + blocks.length - 1} after ${ticks} failed ticks`, error);
+        }
+      };
       // Every version of a tracked (or deferred) post, with its exact block, transaction and image hash.
-      const versions = await versionsFromBlocks(blocks, s.cursor, (a, p) => tracked.has(`${a}/${p}`));
-      if (versions.length) {
+      await runStep("versions", async () => {
+        const versions = await versionsFromBlocks(blocks, first, (a, p) => tracked.has(`${a}/${p}`));
+        if (!versions.length) return;
         await writeVersions(this.env.DB, versions);
         for (const author of new Set(versions.map((v) => v.author))) await relabelKinds(this.env, author);
         // Artworks already hashed by the consumer pick up the exact times now; ones still in the
         // queue read them when their stats stage runs.
         for (const id of await artworksWithHashes(this.env.DB, versions.map((v) => v.content_hash ?? ""))) await refreshImageHistory(this.env.DB, id);
-      }
-      for (const op of market) await handleMarketOp(this.env, op);
+      });
+      if (market.length) await runStep("market", async () => {
+        for (const op of market) await handleMarketOp(this.env, op);
+      });
+      s.stuckStep = null; // both steps done (or skipped) for these blocks
 
       // the posts deferred on earlier ticks that are due (not those deferred just now: they are due later)
       const retried = await this.retryDeferred(deferred, deferPerTick);

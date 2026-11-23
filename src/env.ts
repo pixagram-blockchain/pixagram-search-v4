@@ -81,6 +81,16 @@ export interface Env {
   RECONCILE_HOURS?: string;
   /** v4.8.3: window of the nightly reconciliation, in hours (default 48; 0 = off) */
   RECONCILE_DEEP_HOURS?: string;
+  /**
+   * v4.8.4: the rolling reconciliation walks Hivemind's whole listing, newest to oldest, this many
+   * pages of 20 per ten-minute run, then starts over (default 10; 0 = off). Any post the index
+   * lacks, whatever its age, comes back within one pass, without a backfill run by hand.
+   */
+  RECONCILE_FULL_PAGES?: string;
+  /** v4.8.4: posts the rolling reconciliation ingests per run at most (default 100; the page in hand is finished) */
+  RECONCILE_FULL_MAX_INGEST?: string;
+  /** v4.8.4: failed ticks in a row on the same step of the same blocks (edit history, marketplace) before that step is skipped for them (default 6) */
+  TAIL_STEP_SKIP_AFTER?: string;
   /** Walk each account's comment history during the backfill (post_versions). Default "true". */
   HISTORY_BACKFILL?: string;
   /** Max account_history calls per account in one backfill step (each scans ≤ 2000 ops). Default 300. */

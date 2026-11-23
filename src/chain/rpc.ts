@@ -1,11 +1,30 @@
 // Minimal JSON-RPC client for the Pixa chain (Hive-compatible).
 // Primary endpoint with fallbacks; retries on network errors and 5xx; no retry on RPC asserts.
+//
+// v4.8.4: a failed call moves on through every node (before: the primary and the first two
+// fallbacks only, so three nodes down stopped the tail while three others answered), and the
+// node that answered is tried first for the next ten minutes (per isolate), so a primary that hangs
+// costs its timeout once instead of on every call. The timeout now covers reading the reply too: a
+// node that sent its headers and then stalled used to hold a call until the invocation was killed.
 
 export interface RpcOptions {
   url: string;
   fallbacks?: string[];
   timeoutMs?: number;
+  /**
+   * Tries after the first. Unset: every node once (at least three tries). Set: exactly that many
+   * more, so a request path that allows itself one try (retries: 0) keeps its time bound.
+   */
   retries?: number;
+}
+
+/** The node that answered last, per list of nodes (this isolate), and since when it is preferred. */
+const PREFERRED = new Map<string, { url: string; since: number }>();
+/** How long a fallback that answered is tried first; then the configured order (the primary) again. */
+export const PREFER_MS = 10 * 60_000;
+/** Forget the preferred nodes (tests). */
+export function resetPreferredNodes(): void {
+  PREFERRED.clear();
 }
 
 export class RpcError extends Error {
@@ -51,47 +70,82 @@ export type ContentState = { post: CondenserPost } | { absent: "deleted" | "unkn
 export class ChainRpc {
   private readonly urls: string[];
   private readonly timeoutMs: number;
-  private readonly retries: number;
+  private readonly attempts: number;
   private id = 1;
 
   constructor(opts: RpcOptions) {
-    this.urls = [opts.url, ...(opts.fallbacks ?? [])].filter(Boolean);
+    this.urls = [...new Set([opts.url, ...(opts.fallbacks ?? [])].filter(Boolean))];
     this.timeoutMs = opts.timeoutMs ?? 30_000;
-    this.retries = opts.retries ?? 2;
+    this.attempts = opts.retries === undefined ? Math.max(3, this.urls.length) : Math.max(1, opts.retries + 1);
   }
 
-  async call<T = unknown>(method: string, params: unknown = []): Promise<T> {
+  /** The nodes in the order a call tries them: the one that answered lately first, then the configured order. */
+  nodes(): string[] {
+    const p = PREFERRED.get(this.urls.join(" "));
+    if (!p || Date.now() - p.since > PREFER_MS || !this.urls.includes(p.url)) return this.urls;
+    return [p.url, ...this.urls.filter((u) => u !== p.url)];
+  }
+
+  /** How many distinct nodes this client knows. */
+  nodeCount(): number {
+    return this.urls.length;
+  }
+
+  /** The node that answered the last call (a result or an assert); null before any. */
+  lastNode: string | null = null;
+
+  private answered(url: string): void {
+    const key = this.urls.join(" ");
+    if (url === this.urls[0]) PREFERRED.delete(key);
+    else if (PREFERRED.get(key)?.url !== url) PREFERRED.set(key, { url, since: Date.now() });
+  }
+
+  /**
+   * `o.from`: start with the from-th configured node (modulo their number) instead of the
+   * preferred one, and leave the preference alone: v4.8.4's deferred posts ask a different node
+   * on every retry, so one node whose Hivemind has stalled cannot hold a post back.
+   */
+  async call<T = unknown>(method: string, params: unknown = [], o: { from?: number } = {}): Promise<T> {
     let lastErr: unknown;
-    const attempts = this.retries + 1;
+    const k = o.from === undefined ? 0 : ((Math.trunc(o.from) % this.urls.length) + this.urls.length) % this.urls.length;
+    const order = o.from === undefined ? this.nodes() : [...this.urls.slice(k), ...this.urls.slice(0, k)];
+    const remember = o.from === undefined;
+    // by default every node once (at least three tries: with one node, that one again)
+    const attempts = this.attempts;
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const url = this.urls[Math.min(attempt, this.urls.length - 1)];
+      const url = order[attempt % order.length];
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
       try {
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
-        let res: Response;
-        try {
-          res = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ jsonrpc: "2.0", id: this.id++, method, params }),
-            signal: ctrl.signal,
-          });
-        } finally {
-          clearTimeout(t);
-        }
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: this.id++, method, params }),
+          signal: ctrl.signal,
+        });
         if (res.status >= 500 || res.status === 429) {
           throw new Error(`HTTP ${res.status} from ${url}`);
         }
+        // still under the timeout: a node that stalls after its headers is a failed attempt too
         const json = (await res.json()) as { result?: T; error?: { code: number; message: string; data?: unknown } };
         if (json.error) {
           // Assert exceptions are deterministic; do not retry them.
           throw new RpcError(json.error.message, method, json.error.code, json.error.data);
         }
+        this.lastNode = url;
+        if (remember) this.answered(url);
         return json.result as T;
       } catch (e) {
-        if (e instanceof RpcError) throw e;
-        lastErr = e;
-        if (attempt < attempts - 1) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+        if (e instanceof RpcError) {
+          // the node works: it answered about the request
+          this.lastNode = url;
+          if (remember) this.answered(url);
+          throw e;
+        }
+        lastErr = (e as { name?: string })?.name === "AbortError" ? new Error(`timed out after ${this.timeoutMs / 1000} s: ${url}`) : e;
+        if (attempt < attempts - 1) await new Promise((r) => setTimeout(r, Math.min(1_000, 250 * (attempt + 1))));
+      } finally {
+        clearTimeout(t);
       }
     }
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
@@ -128,10 +182,10 @@ export class ChainRpc {
    * for a post created in a block it has not processed yet: the tail must not take it for a
    * deletion (src/chain/indexer-do.ts).
    */
-  async getContentState(author: string, permlink: string): Promise<ContentState> {
+  async getContentState(author: string, permlink: string, o: { from?: number } = {}): Promise<ContentState> {
     let r: CondenserPost;
     try {
-      r = await this.call<CondenserPost>("condenser_api.get_content", [author, permlink]);
+      r = await this.call<CondenserPost>("condenser_api.get_content", [author, permlink], o);
     } catch (e) {
       const why = missingReason(e, author, permlink);
       if (why) return { absent: why };

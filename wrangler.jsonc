@@ -20,7 +20,9 @@
 
   // Native stats + features + xBRZ on a 400px artwork take well under a second of CPU; the
   // ceiling is raised so a batch of 10 (and a history backfill step) never trips the default 30 s.
-  "limits": { "cpu_ms": 300000 },
+  // Subrequests per invocation: 10,000 by default on Workers Paid, up to 10 million (16 Nov 2026:
+  // raised to 1,000,000). v4.8.4: one "limits" key (there were two; the second silently won).
+  "limits": { "cpu_ms": 300000, "subrequests": 1000000 },
 
   "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
 
@@ -70,6 +72,13 @@
     "TAIL_DEFER_HOURS": "24",
     "RECONCILE_HOURS": "3",
     "RECONCILE_DEEP_HOURS": "48",
+    // v4.8.4 (README-V4 "v4.8.4"): and a rolling pass over Hivemind's whole listing, newest to
+    // oldest, RECONCILE_FULL_PAGES pages of 20 per ten-minute run (a pass over ~8,000 posts takes a
+    // few hours), then again from the newest: a post the index lacks, of any age, comes back
+    // without a backfill run by hand. At most RECONCILE_FULL_MAX_INGEST posts ingested per run (the
+    // page in hand is finished), so a large gap is spread over hours of the enrichment queue.
+    "RECONCILE_FULL_PAGES": "10",
+    "RECONCILE_FULL_MAX_INGEST": "100",
     "UPSCALE_TARGET": "800",
     // Edit history: walk each author's comment operations during the backfill (post_versions,
     // first_seen, image_since). Each call scans at most 2000 operations.
@@ -224,7 +233,6 @@
     "PAPH_PHASH_DISTANCE": "10",
     "PAPH_CHANNEL_K": "24"
   },
-  "limits": { "cpu_ms": 300000, "subrequests": 1000000 },
   // Per client IP (and Cloudflare location): search-like routes / /ask, /help and /search-by-image /
   // /suggest (one request per pause in typing, several people behind one address). Namespaces of
   // their own (41xx; v3 has 31xx), so the two stacks do not share budgets. The admin token is exempt.
@@ -279,8 +287,9 @@
 
   // 03:17 UTC: vote/payout counters for posts still in their payout window, the background
   // vector samples (semantic z-scores), log pruning and the two-day reconciliation with Hivemind.
-  // Every 10 min: the chain-tail watchdog, the enrichment sweeper (missing or stale stages are
-  // re-enqueued), the documentation sync (a conditional request to GitHub: free when nothing
-  // changed) and the reconciliation of the last few hours.
+  // Every 10 min: the chain-tail watchdog (starts a tail never started, re-arms a stalled one),
+  // the enrichment sweeper (missing or stale stages are re-enqueued), the documentation sync (a
+  // conditional request to GitHub: free when nothing changed), the reconciliation of the last few
+  // hours and the next pages of the rolling pass over the whole listing.
   "triggers": { "crons": ["17 3 * * *", "*/10 * * * *"] }
 }

@@ -8,7 +8,7 @@ import { exportPairs, exportSft, exportTraining, getWeights, setWeights } from "
 import { refreshBackground } from "../search/background";
 import { planQuery } from "../search/planner";
 import { indexerStub } from "../chain/indexer-do";
-import { reconcileRecent, reconcileRecord } from "../chain/reconcile";
+import { fullRecord, reconcileFull, reconcileRecent, reconcileRecord } from "../chain/reconcile";
 import { ingestPostRef, rpcFor } from "../chain/ingest";
 import { parsePost } from "../chain/parse";
 import { setJobsMany, getPostById, rebuildVocab } from "../db/posts";
@@ -159,6 +159,19 @@ admin.post("/reconcile", async (c) => {
   return c.json(await reconcileRecent(c.env, { hours, maxIngest, maxPages: 400, budgetMs: 60_000 }));
 });
 
+/**
+ * v4.8.4: the next pages of the rolling pass over the whole listing now (the cron reads
+ * RECONCILE_FULL_PAGES of them every ten minutes), and where the pass stands.
+ */
+admin.post("/reconcile/full", async (c) => {
+  const sp = new URL(c.req.url).searchParams;
+  const pages = Math.min(100, Math.max(1, int(sp.get("pages") ?? undefined, 20)));
+  const maxIngest = Math.min(300, Math.max(0, int(sp.get("max_ingest") ?? undefined, 100)));
+  const run = await reconcileFull(c.env, { pages, maxIngest, budgetMs: 60_000 });
+  return c.json({ run, record: await fullRecord(c.env) });
+});
+admin.get("/reconcile/full", async (c) => c.json(await fullRecord(c.env)));
+
 /** Rebuild the spelling vocabulary from the search docs (after an in-place upgrade from v2). */
 admin.post("/vocab/rebuild", async (c) => c.json(await rebuildVocab(c.env.DB)));
 
@@ -189,6 +202,7 @@ admin.get("/stats", async (c) => {
     backfill_last: last.results?.[0] ? JSON.parse((last.results[0] as any).v) : null,
     indexer: await (async () => indexerStub(c.env).status())().catch((e: unknown) => ({ error: e instanceof Error ? e.message : String(e) })),
     reconcile: await reconcileRecord(c.env).catch(() => null),
+    reconcile_full: await fullRecord(c.env).catch(() => null),
     config: {
       app_prefixes: list(c.env.APP_PREFIXES),
       semantic: embeddingEnabled(c.env), embed_model: c.env.EMBED_MODEL, embed_dim: int(c.env.EMBED_DIM, 768), embed_views: embedLabel(c.env),

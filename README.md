@@ -17,7 +17,15 @@ sure new posts reach the index: every front end is indexed (Pixtopia's posts, th
 the chain by mid-November, were all filtered out), the tail waits for Hivemind instead of
 dropping a post it does not show yet (at least 50 Pixagram posts lost since 28 October), a
 reconciliation with Hivemind's newest posts catches anything else, and `/healthz` reports the
-tail (README-V4 "v4.8.3").
+tail (README-V4 "v4.8.3"). **v4.8.4** makes the index keep itself complete with nobody stepping
+in: v4.8.3 had been lost in a merge (16 Nov 2026), and on 23 November the index lacked 75
+Pixagram posts created since then — 61 of them from a 23-hour blackout on 18–19 November — and
+2,077 of Pixtopia's. A rolling pass over Hivemind's whole listing now brings back any post the
+index lacks, whatever its age, within hours and without a backfill; a post one node's Hivemind
+does not hold is asked of the other nodes; the watchdog starts a tail never started and re-arms
+a stalled one; one failing step or one unreadable range can no longer hold the tail; the RPC
+client uses every node; and `/healthz` says when the ten-minute cron itself stops (README-V4
+"v4.8.4").
 
 v4 keeps v3's deterministic search as the system of record and builds a retrieval, verification
 and reasoning engine around it. The Pixagram index decides what happened; a language model may
@@ -249,6 +257,8 @@ v3's variables keep their meaning:
 | `MARKET_CUSTOM_JSON_IDS`, `TAIL_BLOCKS_PER_TICK`, `TAIL_IDLE_SECONDS`, `TAIL_PARK_AFTER` | —, 100, 3, 6 | marketplace hook, tail pacing; failed ticks in a row on one post before the tail sets that post aside |
 | `TAIL_DEFER_HOURS`, `TAIL_DEFER_PER_TICK` | 24, 10 | v4.8.3: how long the tail keeps asking Hivemind for a post it does not show yet, and how many such posts per tick |
 | `RECONCILE_HOURS`, `RECONCILE_DEEP_HOURS` | 3, 48 | v4.8.3: window of the ten-minute and of the nightly reconciliation with Hivemind's newest posts; 0 turns either off |
+| `RECONCILE_FULL_PAGES`, `RECONCILE_FULL_MAX_INGEST` | 10, 100 | v4.8.4: pages of 20 the rolling pass over the whole listing reads per ten-minute run (0 = off), and the posts it ingests per run at most (the page in hand is finished) |
+| `TAIL_STEP_SKIP_AFTER` | 6 | v4.8.4: failed ticks in a row on the same step of the same blocks (edit history, marketplace ops) before that step is skipped for them, logged |
 | `ADMIN_TOKEN`, `GITHUB_WEBHOOK_SECRET` (secrets) | — | `/admin/*` bearer token; the documentation push webhook |
 
 v4's (spec §57-58; every model is configuration):
@@ -534,7 +544,7 @@ nightly pass goes through every shard).
 |---|---|
 | `GET /similar/:id` | as v3, plus (v4.8.2) `vector`: `stored`, or `computed` when the artwork had no vector and was embedded for this request (charged to the heavy rate limit; cached a day; its embed stage is queued); `method`: `hybrid` (by the vector), `features` (no vector could be had: shared concepts, colours, shape and pHash, with `similarity.theme` in the semantic part's place, and a `note` saying why) or `none` |
 | `GET /duplicates/:id`, `POST /search-by-image` | as v3 |
-| `GET /healthz` | `ok` (the Worker and D1 answer), and since v4.8.2 `status` (`ok` or `degraded`), `problems`, `semantic` (the Space is ready now), `embedding` (the Space's `/health`: model, CPUs, concurrency; checked at most once a minute) and `vectors` (artworks and posts without a current vector, those missing for over an hour, jobs given up). `?strict=1` answers 503 when degraded, for an uptime monitor. Since v4.8.3 also `tail`: the chain indexer (`running`, `behind_blocks`, `last_tick_age_s`, posts `deferred` because Hivemind does not show them yet, `parked`) and the reconciliation (`reconcile`: its last run, posts recovered in all); degraded when the tail is stopped, stalled for ten minutes, an hour behind, or a post has waited for Hivemind for over an hour |
+| `GET /healthz` | `ok` (the Worker and D1 answer), and since v4.8.2 `status` (`ok` or `degraded`), `problems`, `semantic` (the Space is ready now), `embedding` (the Space's `/health`: model, CPUs, concurrency; checked at most once a minute) and `vectors` (artworks and posts without a current vector, those missing for over an hour, jobs given up). `?strict=1` answers 503 when degraded, for an uptime monitor. Since v4.8.3 also `tail`: the chain indexer (`running`, `behind_blocks`, `last_tick_age_s`, posts `deferred` because Hivemind does not show them yet, `parked`) and the reconciliation (`reconcile`: its last run, posts recovered in all); degraded when the tail is stopped, stalled for ten minutes, an hour behind, or a post has waited for Hivemind for over an hour. Since v4.8.4 `tail.full_pass` (the rolling pass: passes done, pages of the current one, the last complete one, posts recovered, its last run and error), `tail.stopped_at`, `tail.skipped_steps` and `tail.last_skipped`; degraded too when the ten-minute cron has not run for half an hour |
 | `GET /history/:id`, `GET /posts/:id`, `/posts/:author/:permlink`, `GET /concepts`, `/img/…`, `/vocab` | as v3 |
 | `POST /feedback` | search engagement events (v3) |
 | `POST /ask/feedback` | `{query_id, rating: 1 \| -1, reason?: wrong \| unsupported \| incomplete \| other}`, for a recent answer |
@@ -623,3 +633,17 @@ checks to end by then (README-V4 "Copy detection").
   `scripts/admin.sh reconcile [hours]`) compares Hivemind's newest posts with the index every ten
   minutes and nightly. Pixa's Hivemind starts the next page of `get_discussions_by_created` after
   the `start` post, not with it (Hive's condenser repeats it).
+- v4.8.4: every node runs a Hivemind of its own, and the retries of a deferred or parked post ask
+  the next node first (`deferred[].node` says which answered last), so one Hivemind that stops
+  syncing — what fits the 23 hours on 18–19 November when no post reached the index — holds
+  nothing back. Behind both, the rolling pass (`reconcileFull`, `scripts/admin.sh reconcile-full` /
+  `reconcile-status`) walks the whole listing ten pages per ten-minute run and starts again from
+  the newest, so a post the index lacks comes back whatever its age, and a post the index marked
+  deleted while the chain shows it is revived. Bodies are listed truncated to 16 characters: an
+  artwork's data URI stays out of the page, and a post deleted by an edit (its body is the word
+  "deleted") is told from a shown one. The watchdog starts a tail never started (no cursor, no
+  stop) and re-arms one without an alarm or without a tick for 15 minutes; only
+  `POST /admin/indexer/stop` stops it for good (`stoppedAt`). A tick step other than a post's
+  ingestion that keeps failing on the same blocks is skipped after `TAIL_STEP_SKIP_AFTER` ticks
+  (`skipped`, `skippedTotal` in `scripts/admin.sh indexer`), and ranges that cannot be read are
+  read in halves (`readShrink`).
