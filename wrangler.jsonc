@@ -25,7 +25,11 @@
   "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
 
   "vars": {
-    "APP_PREFIXES": "pixagram",
+    // Posts of which front ends are indexed: json_metadata.app prefixes, comma-separated; empty =
+    // every front end. v4.8.3: empty (was "pixagram"). Pixtopia (app "pixtopia/…") started posting
+    // on 1 November 2026 and by mid-November wrote three posts in four on the chain, all of them
+    // left out of the index; a front end launched later is indexed without a change here.
+    "APP_PREFIXES": "",
     "EMBED_DIM": "768",
     // SigLIP 2 NaFlex: images keep their aspect ratio. The Space serves the same model with
     // MAX_NUM_PATCHES = EMBED_PATCHES (deploy.sh sets both; a mismatch stops image embedding).
@@ -58,6 +62,14 @@
     "STORE_IN_R2": "true",
     "TAIL_BLOCKS_PER_TICK": "100",
     "TAIL_IDLE_SECONDS": "3",
+    // v4.8.3 (README-V4 "v4.8.3"): Hivemind, which answers get_content, can be behind the block the
+    // tail reads. A post it does not show yet is deferred and asked again (6 s, 12 s … then every
+    // 10 min) for TAIL_DEFER_HOURS, never taken for deleted. Behind it, the reconciliation compares
+    // Hivemind's newest posts with the index: every ten minutes over RECONCILE_HOURS, nightly over
+    // RECONCILE_DEEP_HOURS (0 turns either off), and ingests what is missing or stale.
+    "TAIL_DEFER_HOURS": "24",
+    "RECONCILE_HOURS": "3",
+    "RECONCILE_DEEP_HOURS": "48",
     "UPSCALE_TARGET": "800",
     // Edit history: walk each author's comment operations during the backfill (post_versions,
     // first_seen, image_since). Each call scans at most 2000 operations.
@@ -266,8 +278,9 @@
   ],
 
   // 03:17 UTC: vote/payout counters for posts still in their payout window, the background
-  // vector samples (semantic z-scores) and log pruning. Every 10 min: the chain-tail watchdog,
-  // the enrichment sweeper (missing or stale stages are re-enqueued) and the documentation sync
-  // (a conditional request to GitHub: free when nothing changed).
+  // vector samples (semantic z-scores), log pruning and the two-day reconciliation with Hivemind.
+  // Every 10 min: the chain-tail watchdog, the enrichment sweeper (missing or stale stages are
+  // re-enqueued), the documentation sync (a conditional request to GitHub: free when nothing
+  // changed) and the reconciliation of the last few hours.
   "triggers": { "crons": ["17 3 * * *", "*/10 * * * *"] }
 }
