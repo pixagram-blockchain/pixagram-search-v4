@@ -20,12 +20,18 @@
 
   // Native stats + features + xBRZ on a 400px artwork take well under a second of CPU; the
   // ceiling is raised so a batch of 10 (and a history backfill step) never trips the default 30 s.
-  "limits": { "cpu_ms": 300000 },
+  // Subrequests per invocation: 10,000 by default on Workers Paid, up to 10 million (16 Nov 2026:
+  // raised to 1,000,000). v4.8.4: one "limits" key (there were two; the second silently won).
+  "limits": { "cpu_ms": 300000, "subrequests": 1000000 },
 
   "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
 
   "vars": {
-    "APP_PREFIXES": "pixagram",
+    // Posts of which front ends are indexed: json_metadata.app prefixes, comma-separated; empty =
+    // every front end. v4.8.3: empty (was "pixagram"). Pixtopia (app "pixtopia/…") started posting
+    // on 1 November 2026 and by mid-November wrote three posts in four on the chain, all of them
+    // left out of the index; a front end launched later is indexed without a change here.
+    "APP_PREFIXES": "",
     "EMBED_DIM": "768",
     // SigLIP 2 NaFlex: images keep their aspect ratio. The Space serves the same model with
     // MAX_NUM_PATCHES = EMBED_PATCHES (deploy.sh sets both; a mismatch stops image embedding).
@@ -58,6 +64,21 @@
     "STORE_IN_R2": "true",
     "TAIL_BLOCKS_PER_TICK": "100",
     "TAIL_IDLE_SECONDS": "3",
+    // v4.8.3 (README-V4 "v4.8.3"): Hivemind, which answers get_content, can be behind the block the
+    // tail reads. A post it does not show yet is deferred and asked again (6 s, 12 s … then every
+    // 10 min) for TAIL_DEFER_HOURS, never taken for deleted. Behind it, the reconciliation compares
+    // Hivemind's newest posts with the index: every ten minutes over RECONCILE_HOURS, nightly over
+    // RECONCILE_DEEP_HOURS (0 turns either off), and ingests what is missing or stale.
+    "TAIL_DEFER_HOURS": "24",
+    "RECONCILE_HOURS": "3",
+    "RECONCILE_DEEP_HOURS": "48",
+    // v4.8.4 (README-V4 "v4.8.4"): and a rolling pass over Hivemind's whole listing, newest to
+    // oldest, RECONCILE_FULL_PAGES pages of 20 per ten-minute run (a pass over ~8,000 posts takes a
+    // few hours), then again from the newest: a post the index lacks, of any age, comes back
+    // without a backfill run by hand. At most RECONCILE_FULL_MAX_INGEST posts ingested per run (the
+    // page in hand is finished), so a large gap is spread over hours of the enrichment queue.
+    "RECONCILE_FULL_PAGES": "10",
+    "RECONCILE_FULL_MAX_INGEST": "100",
     "UPSCALE_TARGET": "800",
     // Edit history: walk each author's comment operations during the backfill (post_versions,
     // first_seen, image_since). Each call scans at most 2000 operations.
@@ -212,7 +233,6 @@
     "PAPH_PHASH_DISTANCE": "10",
     "PAPH_CHANNEL_K": "24"
   },
-  "limits": { "cpu_ms": 300000, "subrequests": 1000000 },
   // Per client IP (and Cloudflare location): search-like routes / /ask, /help and /search-by-image /
   // /suggest (one request per pause in typing, several people behind one address). Namespaces of
   // their own (41xx; v3 has 31xx), so the two stacks do not share budgets. The admin token is exempt.
@@ -266,8 +286,10 @@
   ],
 
   // 03:17 UTC: vote/payout counters for posts still in their payout window, the background
-  // vector samples (semantic z-scores) and log pruning. Every 10 min: the chain-tail watchdog,
-  // the enrichment sweeper (missing or stale stages are re-enqueued) and the documentation sync
-  // (a conditional request to GitHub: free when nothing changed).
+  // vector samples (semantic z-scores), log pruning and the two-day reconciliation with Hivemind.
+  // Every 10 min: the chain-tail watchdog (starts a tail never started, re-arms a stalled one),
+  // the enrichment sweeper (missing or stale stages are re-enqueued), the documentation sync (a
+  // conditional request to GitHub: free when nothing changed), the reconciliation of the last few
+  // hours and the next pages of the rolling pass over the whole listing.
   "triggers": { "crons": ["17 3 * * *", "*/10 * * * *"] }
 }

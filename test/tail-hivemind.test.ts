@@ -394,7 +394,8 @@ describe("reconcileRecent: Hivemind's newest posts against the index", () => {
     expect((await env.DB.prepare("SELECT title FROM posts WHERE author = 'irita'").first<{ title: string }>())!.title).toBe("My friend Sonic");
     // every page after the first started after the previous page's last post
     const pages = n.calls.filter((c) => c.method === "condenser_api.get_discussions_by_created").map((c) => c.params[0]);
-    expect(pages[0]).toMatchObject({ tag: "", limit: 20, truncate_body: 1 });
+    // v4.8.4: 16 characters of each body (enough to see "deleted"; an artwork's data URI stays out)
+    expect(pages[0]).toMatchObject({ tag: "", limit: 20, truncate_body: 16 });
     expect(pages[1].start_permlink).toBe(chain.sort((a, b) => b.created.localeCompare(a.created))[19].permlink);
 
     // recorded for /healthz and /admin/stats; a second run finds nothing left

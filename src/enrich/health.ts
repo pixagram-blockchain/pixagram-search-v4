@@ -5,11 +5,19 @@
 // all the while /healthz answered {"ok": true, "semantic": true}. 298 artworks got no vectors and nothing said so. Now /healthz
 // says "degraded" with the reasons, and /healthz?strict=1 answers 503 then, for an uptime monitor.
 
+//
+// v4.8.3: and whether new posts reach the index at all. The tail dropped posts Hivemind had not
+// processed yet, about two or three Pixagram posts a day, and every Pixtopia post was filtered
+// out, and nothing here said so: /healthz now reports the chain tail (stopped, stalled, behind,
+// posts waiting for Hivemind) and what the reconciliation had to recover.
+
 import type { Env } from "../env";
-import { bool, now } from "../env";
+import { bool, int, now, num } from "../env";
 import { GIVE_UP_AFTER } from "../db/posts";
 import { embedLabel, embeddingEnabled, spaceStatus, type SpaceStatus } from "./embed";
 import { staleImageVector, staleTextVector } from "./sweeper";
+import { indexerStub } from "../chain/indexer-do";
+import { fullRecord, reconcileRecord } from "../chain/reconcile";
 
 /** A vector missing for longer than this is stuck, not on its way (the queue embeds a new artwork within minutes). */
 export const STUCK_AFTER_S = 3600;
@@ -96,6 +104,92 @@ async function countBacklog(env: Env): Promise<VectorBacklog> {
   };
 }
 
+/** The chain tail as /healthz shows it (src/chain/indexer-do.ts, src/chain/reconcile.ts). */
+export interface TailHealth {
+  running: boolean;
+  cursor: number | null;
+  lib: number | null;
+  /** irreversible blocks not read yet (3 s each) */
+  behind_blocks: number | null;
+  last_tick_age_s: number | null;
+  /** posts whose op the tail has read but Hivemind does not show yet, and those waiting for over an hour */
+  deferred: number;
+  deferred_over_hour: number;
+  /** posts set aside because their ingestion kept failing */
+  parked: number;
+  /** the reconciliation's last run, and what it has recovered (posts the tail missed) */
+  reconcile: { last_run_age_s: number; last_missing: number; last_stale: number; recovered_total: number; last_recovery_at: number | null } | null;
+  /**
+   * v4.8.4: the rolling pass over the whole listing: the pass in progress (pages read, posts brought
+   * in so far), the last complete one, and its last run (null before its first run, or when off)
+   */
+  full_pass: {
+    passes: number;
+    pages: number;
+    started_at: number;
+    ingested: number;
+    last_pass_finished_at: number | null;
+    last_pass_pages: number | null;
+    last_pass_ingested: number | null;
+    recovered_total: number;
+    last_run_age_s: number;
+    last_error: string | null;
+  } | null;
+  /** v4.8.4: a stop() is why it is not running (unix seconds), not a fault */
+  stopped_at: number | null;
+  /** v4.8.4: tick steps skipped after failing on the same blocks (edit history, marketplace), in all, and the last one */
+  skipped_steps: number;
+  last_skipped: { step: string; from: number; to: number; error: string; at: number } | null;
+  /** the indexer could not be asked */
+  error?: string;
+}
+
+/** A tick every few seconds is normal; this long without one is a stalled tail. */
+const TAIL_STALLED_S = 600;
+/** About an hour of blocks. */
+const TAIL_BEHIND_BLOCKS = 1200;
+/** The ten-minute cron (watchdog, sweeper, reconciliation) is missing after this long without a run. */
+const CRON_MISSING_S = 1800;
+
+export async function tailHealth(env: Env): Promise<TailHealth | null> {
+  // no Durable Object namespace (tests, local tools): nothing to ask
+  if (typeof (env.INDEXER as { idFromName?: unknown } | undefined)?.idFromName !== "function") return null;
+  const t = now();
+  const [rec, full] = await Promise.all([reconcileRecord(env).catch(() => null), fullRecord(env).catch(() => null)]);
+  const reconcile = rec
+    ? { last_run_age_s: t - rec.last.at, last_missing: rec.last.missing, last_stale: rec.last.stale, recovered_total: rec.recovered_total, last_recovery_at: rec.last_recovery?.at ?? null }
+    : null;
+  const full_pass = full
+    ? {
+        passes: full.passes, pages: full.current.pages, started_at: full.current.started_at, ingested: full.current.ingested,
+        last_pass_finished_at: full.last_pass?.finished_at ?? null, last_pass_pages: full.last_pass?.pages ?? null, last_pass_ingested: full.last_pass?.ingested ?? null,
+        recovered_total: full.recovered_total, last_run_age_s: t - full.last_run.at, last_error: full.last_run.error,
+      }
+    : null;
+  const off = { stopped_at: null, skipped_steps: 0, last_skipped: null };
+  try {
+    const s = await indexerStub(env).status();
+    const hourAgo = Date.now() - 3_600_000;
+    return {
+      running: s.running,
+      cursor: s.cursor,
+      lib: s.lib,
+      behind_blocks: s.cursor !== null && s.lib !== null ? Math.max(0, s.lib - s.cursor + 1) : null,
+      last_tick_age_s: s.lastTickAt ? Math.round((Date.now() - s.lastTickAt) / 1000) : null,
+      deferred: s.deferredWaiting ?? 0,
+      deferred_over_hour: (s.deferred ?? []).filter((d) => d.since < hourAgo).length,
+      parked: s.parked?.length ?? 0,
+      reconcile,
+      full_pass,
+      stopped_at: s.stoppedAt ? Math.floor(s.stoppedAt / 1000) : null,
+      skipped_steps: s.skippedTotal ?? 0,
+      last_skipped: s.skipped?.length ? s.skipped[s.skipped.length - 1] : null,
+    };
+  } catch (e) {
+    return { running: false, cursor: null, lib: null, behind_blocks: null, last_tick_age_s: null, deferred: 0, deferred_over_hour: 0, parked: 0, reconcile, full_pass, ...off, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export interface HealthReport {
   /** the Worker and its database answer */
   ok: true;
@@ -109,20 +203,39 @@ export interface HealthReport {
   /** the Space's /health, checked at most once a minute (null when HF_EMBED_URL is not set) */
   embedding: SpaceStatus | null;
   vectors: VectorBacklog | null;
+  /** v4.8.3: whether new posts reach the index (null without the indexer binding) */
+  tail: TailHealth | null;
 }
 
 export async function healthReport(env: Env): Promise<HealthReport> {
   const on = embeddingEnabled(env);
-  const [row, space, vectors] = await Promise.all([
+  const [row, space, vectors, tail] = await Promise.all([
     env.DB.prepare("SELECT COUNT(*) AS n FROM posts WHERE deleted = 0").first<{ n: number }>(),
     on ? spaceStatus(env) : Promise.resolve(null),
     on ? vectorBacklog(env) : Promise.resolve(null),
+    tailHealth(env).catch(() => null),
   ]);
   const problems: string[] = [];
   const s = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
   if (space && !space.ready) problems.push(`embedding Space not ready: ${space.problem}`);
   if (vectors?.image_stuck) problems.push(`${s(vectors.image_stuck, "artwork", "artworks")} without an image vector for over an hour`);
   if (vectors?.text_stuck) problems.push(`${s(vectors.text_stuck, "post", "posts")} without a text vector for over an hour`);
+  if (tail?.error) problems.push(`chain indexer unreachable: ${tail.error}`);
+  else if (tail) {
+    if (!tail.running) problems.push(tail.stopped_at ? "chain indexer stopped by POST /admin/indexer/stop: new posts are not indexed (POST /admin/indexer/start)" : "chain indexer stopped: new posts are not indexed (POST /admin/indexer/start)");
+    else if (tail.last_tick_age_s !== null && tail.last_tick_age_s > TAIL_STALLED_S) problems.push(`chain indexer stalled: no tick for ${Math.round(tail.last_tick_age_s / 60)} min`);
+    if (tail.behind_blocks !== null && tail.behind_blocks > TAIL_BEHIND_BLOCKS) problems.push(`chain indexer ${tail.behind_blocks} blocks (about ${Math.round((tail.behind_blocks * 3) / 360) / 10} h) behind the chain`);
+    if (tail.deferred_over_hour) problems.push(`${s(tail.deferred_over_hour, "new post", "new posts")} waiting for the node's Hivemind for over an hour`);
+  }
+  // v4.8.4: the ten-minute cron runs the watchdog, the sweeper and the reconciliations; without it
+  // nothing restarts a tail that stops. Its runs are seen through the reconciliations' records.
+  if (tail) {
+    const ages = [
+      num(env.RECONCILE_HOURS, 3) > 0 ? tail.reconcile?.last_run_age_s : undefined,
+      int(env.RECONCILE_FULL_PAGES, 10) > 0 ? tail.full_pass?.last_run_age_s : undefined,
+    ].filter((a): a is number => typeof a === "number");
+    if (ages.length && Math.min(...ages) > CRON_MISSING_S) problems.push(`the ten-minute cron has not run for ${Math.round(Math.min(...ages) / 60)} min (watchdog, sweeper, reconciliation)`);
+  }
   return {
     ok: true,
     status: problems.length ? "degraded" : "ok",
@@ -132,5 +245,6 @@ export async function healthReport(env: Env): Promise<HealthReport> {
     text_vectors: !!env.VEC_TEXT,
     embedding: space,
     vectors,
+    tail,
   };
 }

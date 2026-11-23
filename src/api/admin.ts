@@ -3,11 +3,12 @@
 // benchmark, the configured models, and the learning-to-rank and fine-tuning exports.
 
 import { Hono } from "hono";
-import { ALL_STAGES, BLOG_STAGES, bool, int, num, type Stage } from "../env";
+import { ALL_STAGES, BLOG_STAGES, bool, int, list, num, type Stage } from "../env";
 import { exportPairs, exportSft, exportTraining, getWeights, setWeights } from "../search/feedback";
 import { refreshBackground } from "../search/background";
 import { planQuery } from "../search/planner";
 import { indexerStub } from "../chain/indexer-do";
+import { fullRecord, reconcileFull, reconcileRecent, reconcileRecord } from "../chain/reconcile";
 import { ingestPostRef, rpcFor } from "../chain/ingest";
 import { parsePost } from "../chain/parse";
 import { setJobsMany, getPostById, rebuildVocab } from "../db/posts";
@@ -146,6 +147,31 @@ admin.post("/paph/gc", async (c) => {
 /** Enqueue whatever is missing or stale (the cron does this every 10 minutes too). */
 admin.post("/sweep", async (c) => c.json(await sweep(c.env, int(new URL(c.req.url).searchParams.get("max") ?? undefined, 200))));
 
+/**
+ * v4.8.3: ingest what Hivemind lists from the last `hours` that the index lacks or holds in an
+ * older state (the cron does it every ten minutes over RECONCILE_HOURS, nightly over
+ * RECONCILE_DEEP_HOURS). Bounded per call (?max_ingest, at most 300): repeat while `truncated`.
+ */
+admin.post("/reconcile", async (c) => {
+  const sp = new URL(c.req.url).searchParams;
+  const hours = Math.min(24 * 60, Math.max(0.1, num(sp.get("hours") ?? undefined, 48)));
+  const maxIngest = Math.min(300, Math.max(1, int(sp.get("max_ingest") ?? undefined, 100)));
+  return c.json(await reconcileRecent(c.env, { hours, maxIngest, maxPages: 400, budgetMs: 60_000 }));
+});
+
+/**
+ * v4.8.4: the next pages of the rolling pass over the whole listing now (the cron reads
+ * RECONCILE_FULL_PAGES of them every ten minutes), and where the pass stands.
+ */
+admin.post("/reconcile/full", async (c) => {
+  const sp = new URL(c.req.url).searchParams;
+  const pages = Math.min(100, Math.max(1, int(sp.get("pages") ?? undefined, 20)));
+  const maxIngest = Math.min(300, Math.max(0, int(sp.get("max_ingest") ?? undefined, 100)));
+  const run = await reconcileFull(c.env, { pages, maxIngest, budgetMs: 60_000 });
+  return c.json({ run, record: await fullRecord(c.env) });
+});
+admin.get("/reconcile/full", async (c) => c.json(await fullRecord(c.env)));
+
 /** Rebuild the spelling vocabulary from the search docs (after an in-place upgrade from v2). */
 admin.post("/vocab/rebuild", async (c) => c.json(await rebuildVocab(c.env.DB)));
 
@@ -175,7 +201,10 @@ admin.get("/stats", async (c) => {
     concepts: conc.results?.[0],
     backfill_last: last.results?.[0] ? JSON.parse((last.results[0] as any).v) : null,
     indexer: await (async () => indexerStub(c.env).status())().catch((e: unknown) => ({ error: e instanceof Error ? e.message : String(e) })),
+    reconcile: await reconcileRecord(c.env).catch(() => null),
+    reconcile_full: await fullRecord(c.env).catch(() => null),
     config: {
+      app_prefixes: list(c.env.APP_PREFIXES),
       semantic: embeddingEnabled(c.env), embed_model: c.env.EMBED_MODEL, embed_dim: int(c.env.EMBED_DIM, 768), embed_views: embedLabel(c.env),
       text_vectors: bool(c.env.TEXT_VECTORS, true) && !!c.env.VEC_TEXT, calibration: await getCalibration(c.env),
       vlm: c.env.VLM_BACKEND, vlm_model: (c.env.VLM_BACKEND ?? "gemma").toLowerCase() === "chat" ? (c.env.VLM_MODEL ?? null) : undefined, planner: c.env.PLANNER_BACKEND ?? "auto", scaler: c.env.SCALER, store_in_r2: bool(c.env.STORE_IN_R2, true),

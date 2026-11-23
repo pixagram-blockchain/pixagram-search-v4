@@ -918,3 +918,233 @@ credentials in this environment. Still to be seen: the hardware switch through t
 API, the throughput on 8 vCPU, migration 0007 on the production database, and how long the
 sweeper takes on the real backlog. The Space's logs would show why the Worker's requests did not
 wake it; with a Space that never sleeps, that no longer matters.
+
+## v4.8.3: no post left behind (November 2026)
+
+"Search stops working every four days" turned out to mean "new posts are missing from search",
+for two reasons that had nothing to do with the embedding Space (up for twelve days at the time)
+or the tail's health (no error since 2 November): the index left out a whole front end, and the
+tail silently dropped posts Hivemind had not processed yet. Backfills run by hand brought the
+second kind back, which is why it looked periodic.
+
+### What happened
+
+- **Pixtopia.** `APP_PREFIXES` was `pixagram`. Pixtopia, a third-party Pixa front end (app
+  `pixtopia/0.1.0`, the same artwork format: `format: "image"`, the body a WebP data URI), posted
+  for the first time on 1 November 2026 at 18:25 UTC and by mid-November wrote three posts in
+  four on the chain (167 on 15 November, against Pixagram's 51). All its posts up to 16 November
+  were left out: 1,093, of which 1,066 artworks and 27 blog posts.
+- **Hivemind behind the tail.** The tail reads each irreversible block about three seconds after
+  it is produced (one-block irreversibility: `lib` equals `head`) and asks `get_content` for
+  every post in it. `get_content` is answered by Hivemind, which sometimes had not processed
+  that block yet and answered `Post a/p does not exist`. Since the 13 October fix, that answer
+  meant "gone": the post was marked deleted (a no-op for a new post) and the tail moved on. At
+  least 50 Pixagram posts between 28 October and 15 November were lost that way, all of them
+  never edited, about 5 % of Pixagram's posts, including every post from 20:08 to 21:16 UTC on
+  12 November. A backfill started early on 16 November had restored 29 of them (authors a to j)
+  by 03:30 UTC; 21 were still missing.
+- Neither leak was visible: `/healthz` checked the Space and the vectors, not whether posts
+  arrived, and nothing logged a skipped app or a "missing" post.
+
+How Hivemind times a post, measured on api.pixagram.com on 16 November, on creations and edits
+alike: its `created` and `last_update` are the timestamp of the block *before* the op's (hived
+stamps a post with the head block time, which moves to a block's time only after that block's
+transactions are applied). An op in the block of 03:00:12 gives `last_update` 03:00:09. So once
+Hivemind has processed an op in block N, the post's `last_update` is at least the time of block
+N−1, and a smaller one means Hivemind has not got there yet.
+
+### What changed
+
+| | before | v4.8.3 |
+|---|---|---|
+| front ends indexed | `APP_PREFIXES: "pixagram"` | `APP_PREFIXES: ""`: every front end, Pixtopia and any launched later |
+| `get_content` says "does not exist" after a comment op | taken for a deletion: the post was dropped | the post is *deferred*: asked again on the following ticks (6 s, 12 s, 24 s … then every ten minutes, `deferBackoffMs`), at most `TAIL_DEFER_PER_TICK` (10) a tick, for `TAIL_DEFER_HOURS` (24); its version is recorded from the block at once. Only "was deleted", or an absence after a `delete_comment`, is a deletion |
+| Hivemind shows a post in a state older than the op (an edit, or a delete, it has not applied) | the older state was ingested, and the edit lost until the next one | deferred the same way (the op's `prevAt`, the time of the block before it, against Hivemind's `last_update`); past `TAIL_DEFER_HOURS`, the state Hivemind shows is kept, logged |
+| the time of the block before a range's first block | not needed | the last tick's (`lastBlockTime` in the state), else read from the chain once |
+| parked posts the node says "does not exist" for | settled (dropped) | kept after a comment op (the post exists); posts parked before v4.8.3, without an op, settle as they did |
+| anything else that slips through | a backfill by hand | `src/chain/reconcile.ts`: Hivemind's newest posts (`get_discussions_by_created`, bodies truncated: about 45 KB a page of 20) against the index, every ten minutes over `RECONCILE_HOURS` (3: one or two pages) and nightly over `RECONCILE_DEEP_HOURS` (48); a post missing, or whose `last_update` is newer than the index's, is ingested. Posts younger than five minutes are the tail's. Bounded per run (pages, ingests, time); `POST /admin/reconcile?hours=&max_ingest=` (`scripts/admin.sh reconcile [hours] [max_ingest]`) runs it by hand |
+| `/healthz` | the Space and the vectors | adds `tail`: `running`, `behind_blocks`, `last_tick_age_s`, `deferred`, `deferred_over_hour`, `parked`, and the reconciliation (last run, `recovered_total`, last recovery); `degraded` when the tail is stopped, stalled for ten minutes, more than an hour of blocks behind, or a post has waited for Hivemind for over an hour, or the indexer cannot be asked |
+| `scripts/admin.sh stats` | — | adds `reconcile` and `config.app_prefixes`; `indexer` adds `deferred`, `deferredWaiting`, `deferredTotal`, `deferredGivenUp` |
+
+Pixa's Hivemind starts the next page of `get_discussions_by_created` *after* the `start` post
+(Hive's condenser repeats it); the reconciliation keeps every post of a page and also copes with
+a node that repeats it.
+
+Pixtopia's licence is `{"type": "ALL_RIGHTS_RESERVED"}`, without PIXA's `rightsConfiguration`:
+its posts have `ai_training` unset, and with `AI_TRAINING_FALSE_BLOCKS` empty every stage runs
+on them, as on Pixagram's.
+
+### Deploying it
+
+1. `scripts/deploy-worker.sh`. No migration: the deferred posts live in the indexer's own
+   storage, and the reconciliation's record in `settings`.
+2. Bring in what was missed: `scripts/admin.sh backfill` (every account, 339 on 16 November,
+   with their history, so the versions are exact). It inserts Pixtopia's ~1,100 posts and the
+   Pixagram posts the tail lost, and queues their enrichment: about 1,100 descriptions on
+   Workers AI and as many embeddings on the Space, which 8 vCPU work through within the hour.
+   A backfill started before the deploy runs with the old filter and skips Pixtopia: start a new
+   one after it. `scripts/admin.sh reconcile 24` is the quick way for a recent gap of a day; for
+   two weeks the backfill is cheaper (the reconciliation walks the whole window on every call).
+3. Check: `/healthz` shows `tail` with `running: true`, `behind_blocks` near 0 and
+   `deferred_over_hour: 0`; `/search?author=conayi` (a Pixtopia artist) answers artworks; after a
+   day, `tail.reconcile.recovered_total` says how much the tail still misses (it should stay
+   at, or near, 0).
+
+### Measured
+
+Offline: `npm test` runs 791 tests, 17 of them v4.8.3's (`test/tail-hivemind.test.ts`): a post
+Hivemind does not hold yet is deferred, not deleted, its version recorded, and ingested once
+Hivemind shows it; it is not asked again before it is due; Hivemind's timing (the block before)
+lets a current post in at once, from the first block of a range too (one read of the block
+before, then the last tick's time); a stale edit is deferred until its `last_update` reaches the
+op; a `delete_comment` still shown is deferred, then deleted; "was deleted" after a comment op
+is final; the tail gives up after `TAIL_DEFER_HOURS`, keeping an older state or dropping a post
+never returned, logged; the list of deferred posts stays within one storage value (200 posts,
+100 KB: the oldest go, logged); a tick that fails after deferring a post counts it once;
+`retryParked` keeps a post Hivemind does not hold; the reconciliation
+ingests missing and stale posts from every front end inside its window, skips the newest five
+minutes and what is older than the window, pages after the `start` post, honours
+`APP_PREFIXES` and `maxIngest`, records its runs, and is off at 0; the deployed configuration
+indexes every front end; `/healthz` reports a deferred post over an hour, a stopped, stalled or
+far-behind tail, and an indexer it cannot ask. The new tests fail with the old "does not exist =
+deleted" rule, without the freshness check, with the op's own block time instead of the one
+before, and with the counter bumped before the list is saved. `npm run typecheck` and `wrangler deploy --dry-run` pass.
+
+Live, read-only, against api.pixagram.com on 16 November (in-memory database): the
+reconciliation over three hours read 2 pages, found 34 posts (29 Pixtopia, 5 Pixagram) and
+ingested every one as an artwork with its six stages queued, none failed, in 15 s; the freshness
+rule accepted the three newest posts' last ops and deferred each when asked for one block later.
+
+### Not verified here
+
+Nothing was deployed: there are no Cloudflare credentials in this environment. A Hivemind lag
+was not caught live: during nine minutes of watching (one new post, at 03:00 UTC) Hivemind
+answered at once. The lag is inferred: the lost posts were never edited, the tail recorded no
+error after 2 November, their app passed the filter, and the backfill inserted them as new rows,
+so the tail never stored them; a "does not exist" from Hivemind is the one path that drops a post
+without a trace. The reconciliation covers any other cause, and `tail.reconcile.recovered_total`
+will say whether one remains.
+
+## v4.8.4: indexing without intervention (November 2026)
+
+"It always stops after a while; artworks are no longer indexed. I would like it to work without
+intervention." Since 16 November the index had lost posts in two ways: a trickle (a post now and
+then) and a 23-hour blackout. Both come from the tail taking Hivemind's "does not exist" for an
+answer, which v4.8.3 had fixed. v4.8.3 itself had been lost in a merge, and nothing brought lost
+posts back without someone running a backfill.
+
+### What happened
+
+- **v4.8.3 was lost in a merge.** Commit `cb44a11` (16 Nov 2026, 04:53) brought v4.8.3; commit
+  `72f6bcc` (06:36 the same morning, copy detection 1.3.0) was built on the code before it and
+  replaced `indexer-do.ts`, `rpc.ts`, `health.ts` and `index.ts` with their v4.8.2 versions, put
+  `APP_PREFIXES` back to `"pixagram"` and dropped the reconciliation from the cron, while
+  `reconcile.ts` and its tests stayed behind, unused. That is what was deployed: `/healthz` had no
+  `tail` section.
+- **CI had been red since then**, at `npm ci`: the lockfile's integrity hash for
+  `@pixagram/paph-x` 1.3.0 is not the one npm serves (the hash of a tarball packed before the
+  one published), so the suite never ran on either commit.
+- **Measured on 23 November**, the live index (`/search?sort=newest`, `/posts`, `/history`)
+  against Hivemind's listing since 29 October: 4,063 top-level posts on chain, 2,587 Pixtopia
+  and 1,476 Pixagram. Missing from the index: 2,077 Pixtopia posts (all but 510, presumably
+  brought in by the backfill v4.8.3 asked for) and 114 Pixagram posts, 39 of them deleted by an
+  edit (rightly absent) and **75 real ones, all created since 16 November, none edited.**
+- **The blackout.** 61 of the 75 are from 18 November 13:24 UTC to 19 November 12:32 UTC: in
+  those 23 hours not one Pixagram post reached the index. The tail's own records show it: post
+  2443 (`jotaka/event-portrait…`, its version from block 2,160,277) and post 2444
+  (`failingforwards/promote-your-pixa-art…`, block 2,188,033) are consecutive ids, so nothing was
+  inserted in between, and nothing was afterwards. The blocks where it stopped are ordinary
+  (sizes, op types, no large op). A tail that had stopped and been started again would have
+  caught up from its cursor and inserted those posts; it did not. What fits is a Hivemind on
+  `api.pixagram.com` that stopped syncing for those hours while it kept answering: "does not
+  exist" for every new post, which the tail of the time took for "gone" and dropped. (Logs would
+  say which; whichever it was, v4.8.4 covers both.)
+- **The trickle.** The other 14 are scattered (one or two a day): the three-second race v4.8.3
+  described. Watching new blocks live for 23 minutes, Hivemind showed both new posts 1.6 s and
+  2.9 s after their block, close to the tail's three seconds.
+- **Nothing brought them back but a hand.** v4.8.3's reconciliation looks 3 hours (and nightly
+  48 hours) back; anything older needed `scripts/admin.sh backfill`.
+
+### What changed
+
+| | before | v4.8.4 |
+|---|---|---|
+| v4.8.3 | lost in the merge | restored on top of copy detection 1.3.0 (the deferral of posts Hivemind does not show yet, the freshness check, the reconciliation of the last 3 and 48 hours, `/healthz` `tail`, `APP_PREFIXES: ""`) |
+| a node whose Hivemind has stalled | (v4.8.3) the tail waited for that node's Hivemind, up to 24 hours | each retry of a deferred post asks the next node first (`getContentState(…, { from })`), and each retry of a parked post too: every node runs a Hivemind of its own, so a post one of them does not hold yet goes in from another a few seconds later. The node a deferred post was last asked is in `deferred[].node`. Rotated calls leave the preferred node alone |
+| posts the index lacks, older than 48 hours | a backfill by hand | `reconcileFull`: a rolling pass over Hivemind's whole listing, `RECONCILE_FULL_PAGES` (10) pages of 20 per ten-minute run, newest to oldest, then again from the newest (the ~5,500 posts on chain: a pass in about four and a half hours). At most `RECONCILE_FULL_MAX_INGEST` (100) posts ingested per run, the page in hand always finished, so the cursor only moves past pages done with; a page that fails is read again by the next run, a cursor post that is gone (or a page that fails six runs in a row) starts the pass over, and a node that ignores the cursor is an error, not a loop |
+| a post the index marked deleted while the chain shows it (the old tail did that when Hivemind said "does not exist" about an indexed post) | hidden for good | revived by both reconciliations (`revived`): listings carry 16 characters of each body, enough to tell a body that is the word "deleted" from one that is shown; a post deleted by an edit that the index never had is not ingested |
+| a tail never started (a new Durable Object) | waited for `POST /admin/indexer/start` | started by the watchdog at the irreversible head (the rolling pass fills in what came before); `stop()` records `stoppedAt`, and a tail stopped that way stays stopped (`/healthz` says who stopped it) |
+| a tail with an alarm that does not fire | the watchdog only re-armed a missing alarm | also re-armed when it has not ticked for 15 minutes (`STALL_MS`) |
+| a tick step other than a post's ingestion failing on the same blocks (the edit history's D1 writes, marketplace ops) | the tick failed every 10 s, for good (parking covered posts only) | retried with the tick, then skipped for those blocks after `TAIL_STEP_SKIP_AFTER` (6) ticks in a row, logged, listed in `skipped`, counted in `skippedTotal`; the posts are in already, what is lost is the exact edit history of those blocks (the snapshot version remains) |
+| a block range the node cannot return (a timeout on a large reply) | the same range again every 10 s | read in halves after each failed read (`readShrink`, down to one block), doubling again after 20 good reads; a node that returns no blocks for a range below the head (one behind the node that gave the head) makes the tail wait as when idle instead of spinning |
+| the RPC nodes | the primary and the first two fallbacks: three nodes down stopped everything while three answered; a primary that hung cost 30 s on every call; the timeout ended when the headers came, so a node that stalled after them held a call until the invocation was killed | every node once by default; the node that answered is asked first for ten minutes (per isolate), then the primary again; the timeout covers the body; a caller that allows itself one try (`retries: 0`, `/similar`'s chain read) keeps one try |
+| `/healthz` | v4.8.3's `tail` | adds `tail.full_pass` (passes, pages of the current one, the last complete pass, posts recovered, the last run and its error), `stopped_at`, `skipped_steps`, `last_skipped`; degraded when the ten-minute cron has not run for half an hour (it runs the watchdog, the sweeper and both reconciliations: without it nothing restarts a tail that stops) |
+| `wrangler.jsonc` | two `"limits"` keys (the second silently replaced the first) | one: `cpu_ms` 300,000 and `subrequests` 1,000,000 (Workers Paid allows up to 10 million) |
+| CI | red at `npm ci` since 16 November | the lockfile carries the integrity npm serves for `@pixagram/paph-x` 1.3.0 |
+
+New admin routes: `POST /admin/reconcile/full?pages=&max_ingest=` (the next pages of the rolling
+pass now) and `GET /admin/reconcile/full` (where it stands); `scripts/admin.sh reconcile-full
+[pages] [max_ingest]` and `reconcile-status`. `/admin/stats` adds `reconcile_full`.
+
+### Deploying it
+
+1. `scripts/deploy-worker.sh`. No migration: the rolling pass keeps its cursor in `settings`
+   (`reconcile:full`), the tail its new fields in its own storage.
+2. Nothing else. Within the hour the reconciliations bring in the newest missed posts; the first
+   pass of the rolling one then brings in the rest — about 2,150 posts (Pixtopia's 2,077 and the
+   75 Pixagram posts lost since 16 November), 100 a run at most, so within about four hours — with
+   their enrichment queued as they arrive (about 2,150 descriptions on Workers AI, well under a
+   dollar at Gemma 4's prices, and as many embeddings on the Space). To go faster,
+   `scripts/admin.sh reconcile-full 100 300` a few times; `scripts/admin.sh backfill` remains the
+   way to also record every account's exact edit history.
+3. Check: `curl -s https://pixagram-search-v4.p1x4.workers.dev/healthz` shows `tail` with
+   `running: true` and `full_pass` moving; after the first complete pass
+   `full_pass.last_pass_ingested` says what it brought back, and the next pass's should be 0 or
+   near it (anything it still finds is a leak worth a look in the logs: `reconcile (full pass):
+   the index had missed posts`). `/posts/germandude/perkz-in-gta6-1795012809893`, the first post
+   of the blackout, answers.
+4. Optional, and the one thing that tells you without looking: point an uptime monitor at
+   `/healthz?strict=1`. It fails when the tail is stopped, stalled or behind, when posts wait for
+   Hivemind for over an hour, when the cron stops, and when the Space or the vectors do.
+
+### Measured
+
+Offline: `npm test` runs 826 tests, 28 of them v4.8.4's (`test/no-intervention.test.ts`): the
+rolling pass brings back posts of any age over several runs, finishes a pass and starts the next
+from the newest; checks its ingest budget between pages and goes on after the page it finished;
+leaves the newest five minutes to the tail and the apps `APP_PREFIXES` leaves out; revives a post
+marked deleted that the chain shows (the window reconciliation too) and leaves posts deleted by an
+edit alone; starts over when its cursor post is gone and after six failing runs; refuses a node
+that ignores the cursor; is off at 0. A deferred post whose first node does not hold it goes in
+from the next node on the first retry, without moving the preferred node; parked posts rotate
+too. The watchdog starts a tail never started, leaves a stopped one alone (and `/healthz` says
+who stopped it), re-arms one without an alarm or without a tick for 15 minutes. A history step
+failing on the same blocks is retried, then skipped, the post ingested and the cursor past the
+blocks; one failing once is retried and its history written. A range too large for the node is
+read in halves and grows back after twenty good reads (and halves again if it is still too
+large); a node with no blocks yet makes the tail wait, not spin. The RPC client goes past the
+first two fallbacks, asks the node that answered first for ten minutes and then the primary,
+tries each node once when all are down, times out a body that stalls, keeps one try for
+`retries: 0`, and does not retry an assert. `/healthz` reports the pass and a stopped cron; the
+configuration has one `limits` key, the rolling pass on and every front end indexed. Each feature
+was checked against its removal: without it, at least one of these tests fails. v4.8.3's 17
+tests pass on top of copy detection 1.3.0, and so do the other 781. `npm run typecheck` and
+`wrangler deploy --dry-run` pass.
+
+Live, read-only, against api.pixagram.com on 23 November (an in-memory database holding the 350
+posts the live index lists for the last four days): the classification read 62 pages in 13 s and
+found 931 posts to bring in, 916 Pixtopia and 15 Pixagram, the same as the comparison above, and
+left the post deleted by an edit out. One run of the rolling pass (Pixagram only, 62 pages, 16 s)
+ingested 19 Pixagram posts — the 15 and four more just past the window, which the live index
+also lacks — 17 artworks with their six stages queued and two blog posts with their text stage,
+none failed, and left its cursor after the last page it finished.
+
+### Not verified here
+
+Nothing was deployed or written to production: there are no Cloudflare credentials in this
+environment, and no Worker logs. Which of the two (a stalled Hivemind, or a tail stopped and
+started again from a later block) made the 23-hour blackout is inferred from the index and the
+chain, not read from logs; v4.8.4 covers both. Still to be seen live: the watchdog and the
+skipped steps on the Durable Object runtime, the rolling pass's pace over the full listing (its
+pages were measured on four days of it), and how the enrichment queue absorbs ~2,150 posts at
+100 per ten minutes alongside new ones.
